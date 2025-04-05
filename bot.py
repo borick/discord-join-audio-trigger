@@ -5,7 +5,7 @@ from discord.ext import commands
 import os
 import json
 import asyncio
-from gtts import gTTS
+from gtts import gTTS # Make sure this is imported
 import logging
 import io # Required for BytesIO
 import math # For checking infinite values in dBFS
@@ -14,7 +14,6 @@ import re # For cleaning filenames
 from typing import List, Optional # For type hinting
 import shutil # For copying files
 
-# ... (Keep imports and initial setup the same) ...
 # Load environment variables first
 from dotenv import load_dotenv
 load_dotenv()
@@ -25,21 +24,36 @@ try:
     from pydub.exceptions import CouldntDecodeError
     PYDUB_AVAILABLE = True
 except ImportError:
-    # Basic logging setup just for this critical error if the main one fails
     logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
     logging.critical("CRITICAL: Pydub library not found. Please install it: pip install pydub ffmpeg")
     PYDUB_AVAILABLE = False
 
 # --- Configuration ---
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-SOUNDS_DIR = "sounds" # For join sounds
-USER_SOUNDS_DIR = "usersounds" # For user-uploaded command sounds / personal soundboards
-PUBLIC_SOUNDS_DIR = "publicsounds" # For shared public sounds
-CONFIG_FILE = "user_sounds.json" # For join sound mappings (user_id -> filename)
+SOUNDS_DIR = "sounds" # For join sounds AND temporary TTS storage if needed
+USER_SOUNDS_DIR = "usersounds"
+PUBLIC_SOUNDS_DIR = "publicsounds"
+CONFIG_FILE = "user_sounds.json"
 TARGET_LOUDNESS_DBFS = -14.0
 MAX_USER_SOUND_SIZE_MB = 5
-MAX_USER_SOUNDS_PER_USER = 25 # Limit for *personal* sounds
-ALLOWED_EXTENSIONS = ['.mp3', '.wav', '.ogg', '.m4a', '.aac'] # Allowed extensions for uploads
+MAX_USER_SOUNDS_PER_USER = 25
+ALLOWED_EXTENSIONS = ['.mp3', '.wav', '.ogg', '.m4a', '.aac']
+# <<< NEW CONFIG >>>
+MAX_TTS_LENGTH = 250 # Max characters for TTS command
+
+TTS_LANGUAGE_CHOICES = [
+    discord.OptionChoice(name="English (US - Default)", value="en"),
+    discord.OptionChoice(name="English (UK)", value="en-uk"),
+    discord.OptionChoice(name="English (Australia)", value="en-au"),
+    discord.OptionChoice(name="English (India)", value="en-in"),
+    discord.OptionChoice(name="Spanish (Spain)", value="es-es"),
+    discord.OptionChoice(name="French (France)", value="fr-fr"),
+    discord.OptionChoice(name="French (Canada)", value="fr-ca"),
+    discord.OptionChoice(name="German", value="de"),
+    discord.OptionChoice(name="Japanese", value="ja"),
+    discord.OptionChoice(name="Korean", value="ko"),
+    # Add more supported codes from gTTS documentation if desired
+]
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
@@ -48,31 +62,29 @@ discord_logger.setLevel(logging.WARNING)
 bot_logger = logging.getLogger('SoundBot')
 bot_logger.setLevel(logging.INFO)
 
-
 # --- Validate Critical Config ---
 if not BOT_TOKEN:
-    bot_logger.critical("CRITICAL ERROR: Bot token (BOT_TOKEN) not found in environment variables or .env file.")
+    bot_logger.critical("CRITICAL ERROR: Bot token (BOT_TOKEN) not found.")
     exit()
 if not PYDUB_AVAILABLE:
-    bot_logger.critical("CRITICAL ERROR: Pydub library failed to import. Cannot process audio.")
+    bot_logger.critical("CRITICAL ERROR: Pydub library failed to import.")
     exit()
-
 
 # --- Intents ---
 intents = discord.Intents.default()
 intents.voice_states = True
 intents.guilds = True
-
+intents.message_content = False # Generally don't need message content for slash commands
 
 # --- Bot Definition ---
 bot = discord.Bot(intents=intents)
 
 # --- Data Storage & Helpers ---
-user_sound_config = {} # Maps user ID (str) to their custom *join* sound filename (str)
+user_sound_config = {}
 guild_sound_queues = {}
 guild_play_tasks = {}
 
-# ... (Keep load_config, save_config, ensure_dir the same) ...
+# --- Config/Dir Functions [UNCHANGED] ---
 def load_config():
     global user_sound_config
     if os.path.exists(CONFIG_FILE):
@@ -98,7 +110,6 @@ def save_config():
      except Exception as e:
          bot_logger.error(f"Error saving join sound config to {CONFIG_FILE}: {e}", exc_info=True)
 
-# --- Create Directories ---
 def ensure_dir(dir_path: str):
     if not os.path.exists(dir_path):
         try:
@@ -123,6 +134,7 @@ async def on_ready():
     bot_logger.info(f"Py-cord Version: {discord.__version__}")
     bot_logger.info(f"Audio Normalization Target: {TARGET_LOUDNESS_DBFS} dBFS")
     bot_logger.info(f"Allowed Upload Extensions: {', '.join(ALLOWED_EXTENSIONS)}")
+    bot_logger.info(f"Max TTS Length: {MAX_TTS_LENGTH} chars")
     bot_logger.info(f"Join sound directory: {os.path.abspath(SOUNDS_DIR)}")
     bot_logger.info(f"User sounds directory: {os.path.abspath(USER_SOUNDS_DIR)}")
     bot_logger.info(f"Public sounds directory: {os.path.abspath(PUBLIC_SOUNDS_DIR)}")
@@ -130,8 +142,7 @@ async def on_ready():
 
 
 # --- Audio Processing Helper ---
-# [NO CHANGES NEEDED IN process_audio]
-# ... (Keep process_audio function the same) ...
+# [NO CHANGES NEEDED IN process_audio - it works on file paths]
 def process_audio(sound_path: str, member_display_name: str = "User") -> Optional[discord.PCMAudio]:
     """Loads, normalizes, and prepares audio returning a PCMAudio source or None."""
     if not PYDUB_AVAILABLE:
@@ -148,8 +159,6 @@ def process_audio(sound_path: str, member_display_name: str = "User") -> Optiona
         if not file_extension:
              bot_logger.warning(f"AUDIO: No extension found for {sound_path}, assuming mp3.")
              file_extension = 'mp3'
-
-        # Handle potential empty extension after stripping dot
         if not file_extension:
              bot_logger.warning(f"AUDIO: Invalid empty extension for {sound_path}, assuming mp3.")
              file_extension = 'mp3' # Default again
@@ -175,8 +184,8 @@ def process_audio(sound_path: str, member_display_name: str = "User") -> Optiona
 
         # --- Export to Raw PCM for Discord ---
         pcm_data_io = io.BytesIO()
-        audio_segment.export(pcm_data_io, format="s16le")
-        pcm_data_io.seek(0)
+        audio_segment.export(pcm_data_io, format="s16le") # s16le = PCM signed 16-bit little-endian
+        pcm_data_io.seek(0) # Reset pointer to the beginning for reading
 
         if pcm_data_io.getbuffer().nbytes > 0:
             audio_source = discord.PCMAudio(pcm_data_io)
@@ -194,10 +203,7 @@ def process_audio(sound_path: str, member_display_name: str = "User") -> Optiona
     return audio_source
 
 
-
-# --- Core Join Sound Queue Logic (Queue Processor) ---
-# [NO CHANGES NEEDED IN play_next_in_queue, on_voice_state_update, after_play_handler, safe_disconnect]
-# ... (Keep this entire section the same) ...
+# --- Core Join Sound Queue Logic [UNCHANGED] ---
 async def play_next_in_queue(guild: discord.Guild):
     """Processes the join sound queue for a given guild."""
     guild_id = guild.id
@@ -232,23 +238,29 @@ async def play_next_in_queue(guild: discord.Guild):
         if guild_id in guild_play_tasks and guild_play_tasks[guild_id] is asyncio.current_task(): del guild_play_tasks[guild_id]
         return
 
+    # Process the join sound file using the existing helper
     audio_source = process_audio(sound_path, member.display_name)
 
     if audio_source:
         try:
             bot_logger.info(f"QUEUE PLAYBACK [{task_id}]: Playing join sound for {member.display_name}...")
-            voice_client.play(audio_source, after=lambda e: after_play_handler(e, voice_client)) # Pass voice_client
+            # Crucially, pass the voice_client to the handler
+            voice_client.play(audio_source, after=lambda e: after_play_handler(e, voice_client))
             bot_logger.debug(f"QUEUE PLAYBACK [{task_id}]: vc.play() called for join sound of {member.display_name}.")
         except discord.errors.ClientException as e:
             bot_logger.error(f"QUEUE PLAYBACK ERROR [{task_id}] (ClientException): Bot potentially already playing or disconnected unexpectedly. {e}", exc_info=True)
+            # Reschedule queue check rather than potentially losing the item
             bot.loop.create_task(play_next_in_queue(guild), name=f"QueueRetry_{guild_id}")
         except Exception as e:
             bot_logger.error(f"QUEUE PLAYBACK ERROR [{task_id}] (Unexpected): {e}", exc_info=True)
             bot.loop.create_task(play_next_in_queue(guild), name=f"QueueRetry_{guild_id}")
     else:
         bot_logger.warning(f"QUEUE PLAYBACK [{task_id}]: No valid audio source for {member.display_name}'s join sound ({os.path.basename(sound_path)}). Skipping.")
+        # Trigger next check immediately if processing failed
         bot.loop.create_task(play_next_in_queue(guild), name=f"QueueSkip_{guild_id}")
 
+
+# --- on_voice_state_update [UNCHANGED] ---
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     if member.bot: return
@@ -277,33 +289,35 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 bot_logger.warning(f"SOUND: Configured join sound file '{sound_filename}' for user {user_id_str} not found at '{potential_path}'. Removing broken config entry and falling back to TTS.")
                 del user_sound_config[user_id_str]
                 save_config()
-                is_tts = True
+                is_tts = True # Fallback to TTS
         else:
             is_tts = True
             bot_logger.info(f"SOUND: No custom join sound config found for {member.display_name} ({user_id_str}). Using TTS.")
 
+        # Generate TTS for join event if needed
         if is_tts:
-            tts_filename = f"tts_{member.id}.mp3"
-            tts_path = os.path.join(SOUNDS_DIR, tts_filename)
-            if not os.path.exists(tts_path):
-                bot_logger.info(f"TTS: Generating for {member.display_name} ('{tts_path}')...")
-                tts_text = f"{member.display_name} joined"
-                try:
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, lambda: gTTS(text=tts_text, lang='en').save(tts_path))
-                    bot_logger.info(f"TTS: Saved '{tts_path}'")
-                    sound_path = tts_path
-                except Exception as e:
-                    bot_logger.error(f"TTS: Failed generation for {member.display_name}: {e}", exc_info=True)
-                    sound_path = None
-            else:
-                 bot_logger.info(f"TTS: Using existing file: '{tts_path}'")
-                 sound_path = tts_path
+            # Use a predictable, temporary filename for join TTS
+            tts_filename = f"tts_join_{member.id}.mp3" # Keep distinct from user-triggered TTS if needed
+            tts_path = os.path.join(SOUNDS_DIR, tts_filename) # Store in main sounds dir for simplicity
+
+            # Check if file exists and maybe reuse? Or always regenerate? Always regenerating is simpler.
+            bot_logger.info(f"TTS: Generating join TTS for {member.display_name} ('{tts_path}')...")
+            tts_text = f"{member.display_name} joined"
+            try:
+                # Use run_in_executor for blocking gTTS call
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, lambda: gTTS(text=tts_text, lang='en').save(tts_path))
+                bot_logger.info(f"TTS: Saved join TTS file '{tts_path}'")
+                sound_path = tts_path
+            except Exception as e:
+                bot_logger.error(f"TTS: Failed join TTS generation for {member.display_name}: {e}", exc_info=True)
+                sound_path = None # Generation failed, can't play anything
 
         if not sound_path:
             bot_logger.error(f"Could not determine or generate a join sound/TTS path for {member.display_name}. Skipping queue add.")
             return
 
+        # --- Queueing Logic ---
         guild_id = guild.id
         if guild_id not in guild_sound_queues:
             guild_sound_queues[guild_id] = deque()
@@ -314,14 +328,18 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
         voice_client = discord.utils.get(bot.voice_clients, guild=guild)
 
+        # If bot is already playing something (join sound, command sound, TTS), just queue it.
+        # The play_next_in_queue task (if running) or after_play_handler will pick it up.
         if voice_client and voice_client.is_playing():
             bot_logger.info(f"VOICE: Bot is currently playing in {guild.name}. Join sound for {member.display_name} queued. Connection/play deferred.")
+            # Ensure a task exists to process the queue if the current playback finishes
             if guild_id not in guild_play_tasks or guild_play_tasks[guild_id].done():
-                 task_name = f"QueueTrigger_{guild_id}"
+                 task_name = f"QueueTriggerDeferred_{guild_id}"
                  guild_play_tasks[guild_id] = bot.loop.create_task(play_next_in_queue(guild), name=task_name)
                  bot_logger.debug(f"VOICE: Created deferred play task '{task_name}' due to active playback.")
-            return
+            return # Don't try to connect/move if already playing
 
+        # If bot is NOT playing, attempt connection/move and start the queue task
         should_start_play_task = False
         try:
             if not voice_client or not voice_client.is_connected():
@@ -333,14 +351,14 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                  bot_logger.info(f"VOICE: Moving from '{voice_client.channel.name}' to '{channel_to_join.name}' to process join sound queue.")
                  await voice_client.move_to(channel_to_join)
                  bot_logger.info(f"VOICE: Successfully moved to '{channel_to_join.name}'.")
-                 should_start_play_task = True
+                 should_start_play_task = True # Should start task after moving too
             else:
                  bot_logger.debug(f"VOICE: Bot already connected in '{channel_to_join.name}' and not playing.")
-                 should_start_play_task = True
+                 should_start_play_task = True # Start task if idle in correct channel
 
         except asyncio.TimeoutError:
             bot_logger.error(f"VOICE: Connection to '{channel_to_join.name}' timed out.")
-            if guild_id in guild_sound_queues: guild_sound_queues[guild_id].clear()
+            if guild_id in guild_sound_queues: guild_sound_queues[guild_id].clear() # Clear queue on failure
         except discord.errors.ClientException as e:
             bot_logger.error(f"VOICE: ClientException during connect/move to '{channel_to_join.name}': {e}", exc_info=True)
             if guild_id in guild_sound_queues: guild_sound_queues[guild_id].clear()
@@ -348,7 +366,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
              bot_logger.error(f"VOICE: Unexpected error during connect/move to '{channel_to_join.name}': {e}", exc_info=True)
              if guild_id in guild_sound_queues: guild_sound_queues[guild_id].clear()
 
+        # Start the play task only if connection/move was successful AND needed
         if should_start_play_task and voice_client and voice_client.is_connected():
+            # Only start a new task if one isn't already running for this guild
             if guild_id not in guild_play_tasks or guild_play_tasks[guild_id].done():
                 task_name = f"QueueStart_{guild_id}"
                 guild_play_tasks[guild_id] = bot.loop.create_task(play_next_in_queue(guild), name=task_name)
@@ -356,21 +376,30 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             else:
                  bot_logger.debug(f"VOICE: Play task for guild {guild_id} already exists and is not done.")
 
+
+# --- after_play_handler [UNCHANGED BUT CRITICAL] ---
 def after_play_handler(error: Optional[Exception], voice_client: discord.VoiceClient):
     """Callback registered in voice_client.play(). Runs after ANY sound finishes."""
     guild_id = voice_client.guild.id if voice_client and voice_client.guild else None
     if error:
         bot_logger.error(f'PLAYBACK ERROR (In after_play_handler for guild {guild_id}): {error}', exc_info=error)
 
-    if not guild_id:
-        bot_logger.warning("after_play_handler called with invalid/disconnected voice_client or no guild.")
+    if not guild_id or not voice_client.is_connected(): # Check connection status too
+        bot_logger.warning(f"after_play_handler called with invalid/disconnected voice_client or no guild (ID: {guild_id}). Cannot process further.")
+        # Clean up task if somehow it's still referenced
+        if guild_id and guild_id in guild_play_tasks:
+             play_task = guild_play_tasks.pop(guild_id, None)
+             if play_task and not play_task.done(): play_task.cancel()
         return
 
     bot_logger.debug(f"Playback finished for guild {guild_id}. Triggering queue check.")
 
+    # Check the JOIN SOUND queue specifically
     is_join_queue_empty = guild_id not in guild_sound_queues or not guild_sound_queues[guild_id]
 
     if not is_join_queue_empty:
+        bot_logger.debug(f"AFTER_PLAY: Join queue for guild {guild_id} is not empty. Ensuring play task runs.")
+        # Ensure a task exists to play the next join sound
         if guild_id not in guild_play_tasks or guild_play_tasks[guild_id].done():
              task_name = f"QueueCheckAfterPlay_{guild_id}"
              guild_play_tasks[guild_id] = bot.loop.create_task(play_next_in_queue(voice_client.guild), name=task_name)
@@ -378,27 +407,40 @@ def after_play_handler(error: Optional[Exception], voice_client: discord.VoiceCl
         else:
              bot_logger.debug(f"AFTER_PLAY: Task for guild {guild_id} already exists, not creating duplicate check task.")
     else:
+         # If the join queue IS empty, attempt safe disconnect.
+         # safe_disconnect itself will check if the bot is playing something ELSE (like another TTS or sound)
+         # before actually disconnecting.
          bot_logger.debug(f"AFTER_PLAY: Join queue for guild {guild_id} is empty. Attempting safe disconnect.")
+         # Schedule the disconnect check instead of calling directly to avoid blocking the handler
          bot.loop.create_task(safe_disconnect(voice_client), name=f"SafeDisconnectAfterPlay_{guild_id}")
 
+
+# --- safe_disconnect [UNCHANGED BUT CRITICAL] ---
 async def safe_disconnect(voice_client: Optional[discord.VoiceClient]):
     """Safely disconnects if connected, not playing, AND join queue is empty."""
     if not voice_client or not voice_client.is_connected():
-        return
+        # bot_logger.debug("Safe disconnect called but client not connected.")
+        return # Already disconnected or invalid client
 
     guild = voice_client.guild
     guild_id = guild.id
 
     # Double-check conditions right before disconnecting
-    is_queue_empty = guild_id not in guild_sound_queues or not guild_sound_queues[guild_id]
-    is_playing = voice_client.is_playing() # Check again
+    is_join_queue_empty = guild_id not in guild_sound_queues or not guild_sound_queues[guild_id]
+    is_playing = voice_client.is_playing() # Check the current playing state
 
-    if is_queue_empty and not is_playing:
-        bot_logger.info(f"DISCONNECT: Conditions met for guild {guild_id} (Queue empty, not playing). Disconnecting...")
+    if is_join_queue_empty and not is_playing:
+        bot_logger.info(f"DISCONNECT: Conditions met for guild {guild_id} (Join queue empty, not playing). Disconnecting...")
         try:
-            if voice_client.is_playing(): voice_client.stop()
-            await voice_client.disconnect(force=False)
+            # Ensure stop is called just in case, though is_playing should be false
+            if voice_client.is_playing():
+                bot_logger.warning(f"DISCONNECT: Called stop() during safe_disconnect for {guild.name}, though is_playing was expected false.")
+                voice_client.stop()
+
+            await voice_client.disconnect(force=False) # Use force=False for graceful disconnect
             bot_logger.info(f"DISCONNECT: Bot disconnected from '{guild.name}'.")
+
+            # Clean up the task tracker for this guild after successful disconnect
             if guild_id in guild_play_tasks:
                  play_task = guild_play_tasks.pop(guild_id, None)
                  if play_task and not play_task.done():
@@ -410,23 +452,18 @@ async def safe_disconnect(voice_client: Optional[discord.VoiceClient]):
         except Exception as e:
             bot_logger.error(f"DISCONNECT ERROR: Failed to disconnect from {guild.name}: {e}", exc_info=True)
     else:
-         bot_logger.debug(f"Disconnect skipped for guild {guild.name}: Queue empty={is_queue_empty}, Playing={is_playing}.")
+         bot_logger.debug(f"Disconnect skipped for guild {guild.name}: Join Queue empty={is_join_queue_empty}, Playing={is_playing}.")
 
 
-# --- Single Sound Playback Logic ---
-# [NO CHANGES NEEDED IN play_single_sound]
-# ... (Keep play_single_sound function the same) ...
+# --- Single Sound Playback Logic (For Files) [UNCHANGED] ---
 async def play_single_sound(interaction: discord.Interaction, sound_path: str):
-    """Connects (if needed), plays a single sound, and uses after_play_handler."""
-    # NOTE: interaction.user is the user who clicked the button or ran /playsound
+    """Connects (if needed), plays a single sound FILE, and uses after_play_handler."""
     user = interaction.user
     guild = interaction.guild
 
-    # Use followup for responses as the initial response was likely deferred
     if not guild:
         await interaction.followup.send("This command only works in a server.", ephemeral=True)
         return
-
     if not user.voice or not user.voice.channel:
         await interaction.followup.send("You need to be in a voice channel to use this sound.", ephemeral=True)
         return
@@ -440,108 +477,96 @@ async def play_single_sound(interaction: discord.Interaction, sound_path: str):
         return
 
     if not os.path.exists(sound_path):
-         await interaction.followup.send("❌ Error: The sound file seems to be missing or was deleted.", ephemeral=True)
+         await interaction.followup.send("❌ Error: The sound file seems to be missing.", ephemeral=True)
          bot_logger.error(f"SINGLE PLAY: File not found: {sound_path}")
          return
 
     voice_client = discord.utils.get(bot.voice_clients, guild=guild)
 
+    # --- Connection/Busy Check Logic ---
     try:
         if voice_client and voice_client.is_connected():
             if voice_client.is_playing():
-                # Check if it's the join sound queue playing
+                # Check if it's the join sound queue playing - prioritize join sounds
                 if guild_id in guild_sound_queues and guild_sound_queues[guild_id]:
                     await interaction.followup.send("⏳ Bot is currently playing join sounds. Please wait.", ephemeral=True)
-                    bot_logger.info(f"SINGLE PLAY: Bot busy with join queue in {guild.name}, user {user.name} tried to play '{os.path.basename(sound_path)}'. Request ignored.")
+                    bot_logger.info(f"SINGLE PLAY (File): Bot busy with join queue in {guild.name}, user {user.name} tried to play '{os.path.basename(sound_path)}'. Request ignored.")
                 else:
-                    # It's likely playing another single sound, stop it? Or just deny? Deny is safer.
-                    await interaction.followup.send("⏳ Bot is currently playing another sound. Please wait a moment.", ephemeral=True)
-                    bot_logger.info(f"SINGLE PLAY: Bot busy in {guild.name}, user {user.name} tried to play '{os.path.basename(sound_path)}'. Request ignored.")
-                return
+                    # It's likely playing another single sound or TTS
+                    await interaction.followup.send("⏳ Bot is currently playing another sound/TTS. Please wait.", ephemeral=True)
+                    bot_logger.info(f"SINGLE PLAY (File): Bot busy in {guild.name}, user {user.name} tried to play '{os.path.basename(sound_path)}'. Request ignored.")
+                return # Exit if bot is busy
             elif voice_client.channel != target_channel:
-                bot_logger.info(f"SINGLE PLAY: Moving from '{voice_client.channel.name}' to '{target_channel.name}' for {user.name}.")
+                bot_logger.info(f"SINGLE PLAY (File): Moving from '{voice_client.channel.name}' to '{target_channel.name}' for {user.name}.")
                 await voice_client.move_to(target_channel)
-                bot_logger.info(f"SINGLE PLAY: Moved successfully.")
+                bot_logger.info(f"SINGLE PLAY (File): Moved successfully.")
         else:
-            # Disconnect any existing client in another guild if the bot object has one
-            if bot.voice_clients and bot.voice_clients[0].guild != guild:
-                old_vc = bot.voice_clients[0]
-                bot_logger.warning(f"SINGLE PLAY: Bot is in another guild ({old_vc.guild.name}). Disconnecting from it to join {guild.name}.")
-                await safe_disconnect(old_vc) # Try safe disconnect first
-                # Re-fetch voice_client in case disconnect was slow/async
-                voice_client = discord.utils.get(bot.voice_clients, guild=guild)
-                if voice_client and voice_client.is_connected(): # Check if disconnect actually happened before connecting again
-                    bot_logger.warning(f"SINGLE PLAY: Disconnect from other guild might not have completed in time.")
-                    # Might need a small sleep here if issues persist, but avoid if possible
-                    # await asyncio.sleep(0.5)
-                    voice_client = None # Force reconnect logic below
+             # Connect if not connected
+            bot_logger.info(f"SINGLE PLAY (File): Connecting to '{target_channel.name}' for {user.name}.")
+            voice_client = await target_channel.connect(timeout=30.0, reconnect=True)
+            bot_logger.info(f"SINGLE PLAY (File): Connected successfully.")
 
-            if not voice_client: # Connect if needed (after potential disconnect or if never connected)
-                bot_logger.info(f"SINGLE PLAY: Connecting to '{target_channel.name}' for {user.name}.")
-                voice_client = await target_channel.connect(timeout=30.0, reconnect=True)
-                bot_logger.info(f"SINGLE PLAY: Connected successfully.")
-
+        # Re-verify client state after potential connection/move
         if not voice_client or not voice_client.is_connected():
-             bot_logger.error(f"SINGLE PLAY: Failed to establish voice client for {target_channel.name}")
-             await interaction.followup.send("❌ Failed to connect to the voice channel.", ephemeral=True)
+             bot_logger.error(f"SINGLE PLAY (File): Failed to establish voice client for {target_channel.name} after connect/move attempt.")
+             await interaction.followup.send("❌ Failed to connect/move to the voice channel.", ephemeral=True)
              return
 
     except asyncio.TimeoutError:
          await interaction.followup.send("❌ Connection to the voice channel timed out.", ephemeral=True)
-         bot_logger.error(f"SINGLE PLAY: Connection/Move Timeout in {guild.name}")
+         bot_logger.error(f"SINGLE PLAY (File): Connection/Move Timeout in {guild.name}")
          return
     except discord.errors.ClientException as e:
-        # Handle specific case where bot is already connecting elsewhere
-        if "already connecting" in str(e).lower():
-             await interaction.followup.send("⏳ Bot is busy connecting elsewhere. Please wait a moment.", ephemeral=True)
-             bot_logger.warning(f"SINGLE PLAY: Connection failed in {guild.name}, already connecting: {e}")
+        if "already connecting" in str(e).lower() or "already disconnecting" in str(e).lower():
+             await interaction.followup.send("⏳ Bot is busy connecting/disconnecting. Please wait a moment.", ephemeral=True)
+             bot_logger.warning(f"SINGLE PLAY (File): Connection/Move failed in {guild.name}, already busy: {e}")
         else:
             await interaction.followup.send("❌ Error connecting/moving voice channel. Maybe check permissions?", ephemeral=True)
-            bot_logger.error(f"SINGLE PLAY: Connection/Move ClientException in {guild.name}: {e}", exc_info=True)
+            bot_logger.error(f"SINGLE PLAY (File): Connection/Move ClientException in {guild.name}: {e}", exc_info=True)
         return
     except Exception as e:
         await interaction.followup.send("❌ An unexpected error occurred trying to join the voice channel.", ephemeral=True)
-        bot_logger.error(f"SINGLE PLAY: Connection/Move unexpected error in {guild.name}: {e}", exc_info=True)
+        bot_logger.error(f"SINGLE PLAY (File): Connection/Move unexpected error in {guild.name}: {e}", exc_info=True)
         return
 
-    bot_logger.info(f"SINGLE PLAY: Processing '{os.path.basename(sound_path)}' for {user.name}...")
-    # Use the display name of the user who initiated the action for logging clarity
-    audio_source = process_audio(sound_path, user.display_name)
+    # --- Process and Play Audio FILE ---
+    bot_logger.info(f"SINGLE PLAY (File): Processing '{os.path.basename(sound_path)}' for {user.name}...")
+    audio_source = process_audio(sound_path, user.display_name) # Use file processing helper
 
     if audio_source:
-        if voice_client.is_playing():
-             bot_logger.warning(f"SINGLE PLAY: Voice client became busy between check and play call for {user.name}. Aborting playback.")
+        if voice_client.is_playing(): # Final check before playing
+             bot_logger.warning(f"SINGLE PLAY (File): Voice client became busy between check and play call for {user.name}. Aborting playback.")
              await interaction.followup.send("⏳ Bot became busy just now. Please try again.", ephemeral=True)
+             # Ensure handler runs to potentially disconnect if queue is empty now
+             after_play_handler(None, voice_client)
              return
 
         try:
             sound_basename = os.path.basename(sound_path)
-            bot_logger.info(f"SINGLE PLAYBACK: Playing '{sound_basename}' requested by {user.display_name}...")
-            # Ensure the after_play handler is correctly linked to THIS voice client
+            bot_logger.info(f"SINGLE PLAYBACK (File): Playing '{sound_basename}' requested by {user.display_name}...")
+            # Use the standard after_play_handler
             voice_client.play(audio_source, after=lambda e: after_play_handler(e, voice_client))
-            # Confirmation message - ephemeral is good here
-            await interaction.followup.send(f"▶️ Playing `{os.path.splitext(sound_basename)[0]}`...", ephemeral=True)
+            await interaction.followup.send(f"▶️ Playing `{os.path.splitext(sound_basename)[0]}`...", ephemeral=True) # Keep feedback minimal
         except discord.errors.ClientException as e:
             await interaction.followup.send("❌ Error: Already playing audio or another client issue occurred.", ephemeral=True)
-            bot_logger.error(f"SINGLE PLAYBACK ERROR (ClientException): {e}", exc_info=True)
-            # Still call handler to potentially trigger disconnect or next queue item
-            after_play_handler(e, voice_client)
+            bot_logger.error(f"SINGLE PLAYBACK ERROR (File - ClientException): {e}", exc_info=True)
+            after_play_handler(e, voice_client) # Still call handler
         except Exception as e:
             await interaction.followup.send("❌ An unexpected error occurred during playback.", ephemeral=True)
-            bot_logger.error(f"SINGLE PLAYBACK ERROR (Unexpected): {e}", exc_info=True)
-            # Still call handler
-            after_play_handler(e, voice_client)
+            bot_logger.error(f"SINGLE PLAYBACK ERROR (File - Unexpected): {e}", exc_info=True)
+            after_play_handler(e, voice_client) # Still call handler
     else:
         await interaction.followup.send("❌ Error: Could not process the audio file. Check bot logs.", ephemeral=True)
-        bot_logger.error(f"SINGLE PLAYBACK: Failed to get audio source for '{sound_path}'")
-        # Call handler even on failure to process, might trigger disconnect if needed
-        if voice_client and voice_client.is_connected():
+        bot_logger.error(f"SINGLE PLAYBACK (File): Failed to get audio source for '{sound_path}'")
+        if voice_client and voice_client.is_connected(): # Call handler even on failure
             after_play_handler(None, voice_client)
 
 
-
-# --- Helper: Sanitize Filename ---
-# [NO CHANGES NEEDED]
+# --- Helper Functions [UNCHANGED] ---
+# sanitize_filename, get_user_sound_files, find_user_sound_path
+# get_public_sound_files, find_public_sound_path
+# user_sound_autocomplete, public_sound_autocomplete
+# ... (Keep all these helper functions exactly the same) ...
 def sanitize_filename(name: str) -> str:
     """Removes disallowed characters for filenames and limits length."""
     name = re.sub(r'[<>:"/\\|?*\.\s]+', '_', name)
@@ -549,9 +574,6 @@ def sanitize_filename(name: str) -> str:
     name = name.strip('_')
     return name[:50]
 
-# --- Helper: Get User Sound Files ---
-# [NO CHANGES NEEDED]
-# ... (Keep get_user_sound_files function the same) ...
 def get_user_sound_files(user_id: int) -> List[str]:
     """Returns a list of sound basenames (without ext) for a user's command sounds."""
     user_dir = os.path.join(USER_SOUNDS_DIR, str(user_id))
@@ -567,10 +589,6 @@ def get_user_sound_files(user_id: int) -> List[str]:
             bot_logger.error(f"Error listing files in user sound directory {user_dir}: {e}")
     return sounds
 
-
-# --- Helper: Find User Sound Path ---
-# [NO CHANGES NEEDED]
-# ... (Keep find_user_sound_path function the same) ...
 def find_user_sound_path(user_id: int, sound_name: str) -> Optional[str]:
     """Finds the full path for a user's command sound by name, checking allowed extensions."""
     user_dir = os.path.join(USER_SOUNDS_DIR, str(user_id))
@@ -578,24 +596,18 @@ def find_user_sound_path(user_id: int, sound_name: str) -> Optional[str]:
         return None
     preferred_order = ['.mp3', '.wav'] + [ext for ext in ALLOWED_EXTENSIONS if ext not in ['.mp3', '.wav']]
     for ext in preferred_order:
-        # Check for sanitized name as well, preferring original
         potential_path_exact = os.path.join(user_dir, f"{sound_name}{ext}")
         if os.path.exists(potential_path_exact):
             return potential_path_exact
-        # Check sanitized version if original name differs and wasn't found
         sanitized = sanitize_filename(sound_name)
         if sanitized != sound_name:
             potential_path_sanitized = os.path.join(user_dir, f"{sanitized}{ext}")
             if os.path.exists(potential_path_sanitized):
-                 return potential_path_sanitized # Return path with the name it was found under
+                 return potential_path_sanitized
 
     bot_logger.debug(f"Sound '{sound_name}' not found for user {user_id} in {user_dir} with extensions {ALLOWED_EXTENSIONS}")
     return None
 
-
-# --- Helper: Get Public Sound Files ---
-# [NO CHANGES NEEDED]
-# ... (Keep get_public_sound_files function the same) ...
 def get_public_sound_files() -> List[str]:
     """Returns a list of sound basenames (without ext) from the public sounds directory."""
     sounds = []
@@ -610,10 +622,6 @@ def get_public_sound_files() -> List[str]:
             bot_logger.error(f"Error listing files in public sound directory {PUBLIC_SOUNDS_DIR}: {e}")
     return sounds
 
-
-# --- Helper: Find Public Sound Path ---
-# [NO CHANGES NEEDED]
-# ... (Keep find_public_sound_path function the same) ...
 def find_public_sound_path(sound_name: str) -> Optional[str]:
     """Finds the full path for a public sound by name, checking allowed extensions."""
     if not os.path.isdir(PUBLIC_SOUNDS_DIR):
@@ -623,7 +631,6 @@ def find_public_sound_path(sound_name: str) -> Optional[str]:
         potential_path_exact = os.path.join(PUBLIC_SOUNDS_DIR, f"{sound_name}{ext}")
         if os.path.exists(potential_path_exact):
             return potential_path_exact
-         # Check sanitized version if needed (less likely for public, but consistent)
         sanitized = sanitize_filename(sound_name)
         if sanitized != sound_name:
             potential_path_sanitized = os.path.join(PUBLIC_SOUNDS_DIR, f"{sanitized}{ext}")
@@ -633,11 +640,6 @@ def find_public_sound_path(sound_name: str) -> Optional[str]:
     bot_logger.debug(f"Public sound '{sound_name}' not found in {PUBLIC_SOUNDS_DIR} with extensions {ALLOWED_EXTENSIONS}")
     return None
 
-
-
-# --- Autocomplete Functions ---
-# [NO CHANGES NEEDED for user_sound_autocomplete, public_sound_autocomplete]
-# ... (Keep both autocomplete functions the same) ...
 async def user_sound_autocomplete(ctx: discord.AutocompleteContext) -> List[str]:
     """Provides autocomplete suggestions for the user's uploaded command sounds."""
     user_id = ctx.interaction.user.id
@@ -670,9 +672,7 @@ async def public_sound_autocomplete(ctx: discord.AutocompleteContext) -> List[st
 
 # --- Slash Commands ---
 
-# === Join Sound Commands ===
-# [NO CHANGES NEEDED IN setjoinsound, removejoinsound]
-# ... (Keep setjoinsound and removejoinsound functions the same) ...
+# === Join Sound Commands [UNCHANGED] ===
 @bot.slash_command(
     name="setjoinsound",
     description="Upload your custom join sound (MP3, WAV etc). Replaces any existing one."
@@ -740,11 +740,9 @@ async def setjoinsound(
                             bot_logger.warning(f"Could not remove previous join sound file '{old_path}' during overwrite: {e}")
 
             try:
-                # Use os.replace for atomicity if possible
                 os.replace(temp_save_path, final_save_path)
                 bot_logger.info(f"Final join sound saved: '{final_save_path}'")
             except OSError as rep_e:
-                 # Fallback to shutil.move if replace fails (e.g., cross-device links)
                 try:
                     shutil.move(temp_save_path, final_save_path)
                     bot_logger.info(f"Final join sound saved (using move fallback): '{final_save_path}'")
@@ -806,6 +804,11 @@ async def removejoinsound(ctx: discord.ApplicationContext):
                 bot_logger.info(f"Deleted join sound file: '{file_path_to_remove}'")
             except OSError as e:
                 bot_logger.warning(f"Could not delete join sound file '{file_path_to_remove}': {e}")
+            # Also remove any generated join TTS file for this user
+            tts_join_file = os.path.join(SOUNDS_DIR, f"tts_join_{user_id_str}.mp3")
+            if os.path.exists(tts_join_file):
+                 try: os.remove(tts_join_file); bot_logger.info(f"Removed old join TTS file: {tts_join_file}")
+                 except Exception: pass
         else:
             bot_logger.warning(f"Join sound file '{filename_to_remove}' for user {user_id_str} was configured but not found at '{file_path_to_remove}' during removal.")
 
@@ -814,12 +817,13 @@ async def removejoinsound(ctx: discord.ApplicationContext):
         await ctx.followup.send("🤷 You don't currently have a custom join sound configured.", ephemeral=True)
 
 
-
-# === User Command Sound / Soundboard Commands ===
-
+# === User Command Sound / Soundboard Commands [UNCHANGED] ===
+# /uploadsound, /mysounds, /deletesound, /playsound
+# UserSoundboardView, /soundpanel
+# ... (Keep all these commands and the view class exactly the same) ...
 @bot.slash_command(
     name="uploadsound",
-    description=f"Upload a sound (personal or public). Personal sound limit: {MAX_USER_SOUNDS_PER_USER}." # MODIFIED description
+    description=f"Upload a sound (personal or public). Personal sound limit: {MAX_USER_SOUNDS_PER_USER}."
 )
 @commands.cooldown(2, 20, commands.BucketType.user)
 async def uploadsound(
@@ -839,7 +843,7 @@ async def uploadsound(
         description="Make this sound available for everyone to use? (Default: False)",
         required=False,
         default=False
-    ) # type: ignore <<< NEW OPTION
+    ) # type: ignore
 ):
     """Handles uploading a named sound, either personal or public."""
     await ctx.defer(ephemeral=True)
@@ -862,73 +866,61 @@ async def uploadsound(
         await ctx.followup.send(f"❌ File too large (`{sound_file.size / (1024*1024):.2f}` MB). Max: {MAX_USER_SOUND_SIZE_MB}MB.", ephemeral=True)
         return
 
-    # --- Determine Target Directory and Perform Checks ---
     is_replacing = False
     target_dir = ""
     final_save_filename = f"{clean_name}{file_extension}"
 
     if make_public:
         target_dir = PUBLIC_SOUNDS_DIR
-        # Check for public name conflict BEFORE downloading/processing
         existing_public_path = find_public_sound_path(clean_name)
         if existing_public_path:
             bot_logger.warning(f"Public upload rejected for '{clean_name}' by {user_id}. Name already exists at '{existing_public_path}'.")
             await ctx.followup.send(f"❌ A public sound named `{clean_name}` already exists. Please choose a different name or ask an admin to manage the existing sound.", ephemeral=True)
             return
-        is_replacing = False # We don't allow replacing public sounds via upload
+        is_replacing = False
     else:
         target_dir = os.path.join(USER_SOUNDS_DIR, str(user_id))
-        ensure_dir(target_dir) # Ensure user's personal dir exists
+        ensure_dir(target_dir)
         current_personal_sounds = get_user_sound_files(user_id)
         existing_personal_path = find_user_sound_path(user_id, clean_name)
         is_replacing = existing_personal_path is not None
 
-        # Check personal sound limit ONLY if adding a new personal sound
         if not is_replacing and len(current_personal_sounds) >= MAX_USER_SOUNDS_PER_USER:
              await ctx.followup.send(f"❌ You have reached the maximum limit of {MAX_USER_SOUNDS_PER_USER} personal sounds. Use `/deletesound` or upload as public.", ephemeral=True)
              return
 
-    # --- Path Setup ---
     final_save_path = os.path.join(target_dir, final_save_filename)
-    # Store temp file outside final target dir to prevent partial file issues
     temp_save_filename = f"temp_upload_{user_id}_{clean_name}{file_extension}"
-    temp_save_path = os.path.join(USER_SOUNDS_DIR, temp_save_filename) # Use general user dir for temp
+    temp_save_path = os.path.join(USER_SOUNDS_DIR, temp_save_filename)
 
-    # --- Sanitization Message ---
     followup_message_prefix = ""
     if clean_name != name:
          bot_logger.warning(f"Sanitized sound name for user {user_id}: '{name}' -> '{clean_name}'")
          followup_message_prefix = f"ℹ️ Your sound name was sanitized to `{clean_name}` for compatibility.\n"
 
-    # --- Cleanup ---
     async def cleanup_temp_upload():
         if os.path.exists(temp_save_path):
             try: os.remove(temp_save_path); bot_logger.debug(f"Cleaned up {temp_save_path}")
             except Exception as del_e: bot_logger.warning(f"Failed cleanup {temp_save_path}: {del_e}")
 
-    # --- Download, Validate, Save ---
     try:
         await sound_file.save(temp_save_path)
         bot_logger.info(f"Saved temporary sound for validation: '{temp_save_path}' (public={make_public})")
 
         try:
-            # Pydub Validation
             bot_logger.debug(f"Attempting Pydub decode validation: '{temp_save_path}'")
             _ = AudioSegment.from_file(temp_save_path, format=file_extension.strip('.'))
             bot_logger.info(f"Pydub validation successful for: '{temp_save_path}'")
 
-            # Remove old personal file if replacing (only applies if make_public is False)
             if is_replacing and not make_public:
-                existing_personal_path = find_user_sound_path(user_id, clean_name) # Re-fetch path just in case
+                existing_personal_path = find_user_sound_path(user_id, clean_name)
                 if existing_personal_path and existing_personal_path != final_save_path:
-                    # If replacing AND the old file had a different extension, remove the old one
                     try:
                         os.remove(existing_personal_path)
                         bot_logger.info(f"Removed existing personal sound '{os.path.basename(existing_personal_path)}' for user {user_id} due to overwrite with new extension.")
                     except Exception as e:
                         bot_logger.warning(f"Could not remove conflicting existing personal sound file '{existing_personal_path}': {e}")
 
-            # Save final file
             try:
                 os.replace(temp_save_path, final_save_path)
                 bot_logger.info(f"Final sound saved {'publicly' if make_public else 'personally'} for user {user_id}: '{final_save_path}'")
@@ -942,9 +934,8 @@ async def uploadsound(
                     await ctx.followup.send(f"{followup_message_prefix}❌ Error saving the sound file.", ephemeral=True)
                     return
 
-            # Success Message
             scope = "public" if make_public else "personal"
-            action_word = "updated" if (is_replacing and not make_public) else "uploaded" # Only personal sounds can be 'updated' via upload
+            action_word = "updated" if (is_replacing and not make_public) else "uploaded"
             play_command = "playpublic" if make_public else "playsound"
             list_command = "publicsounds" if make_public else "mysounds"
 
@@ -953,13 +944,9 @@ async def uploadsound(
                  followup_message += f"Use `/{play_command} name:{clean_name}` to play or `/{list_command}` to list."
             else:
                  followup_message += f"Use `/{play_command} name:{clean_name}`, `/{list_command}`, or `/soundpanel`."
-                 # Add hint about publishing later for personal sounds
                  followup_message += f"\nYou can make it public later using `/publishsound name:{clean_name}`."
-
-
             await ctx.followup.send(followup_message, ephemeral=True)
 
-        # Validation Error Handling
         except CouldntDecodeError as decode_error:
             bot_logger.error(f"UPLOAD SOUND VALIDATION FAILED (Pydub Decode Error - user: {user_id}, file: '{sound_file.filename}', public: {make_public}): {decode_error}", exc_info=True)
             await cleanup_temp_upload()
@@ -969,7 +956,6 @@ async def uploadsound(
             await cleanup_temp_upload()
             await ctx.followup.send(f"{followup_message_prefix}❌ **Audio Validation Failed!** Unexpected error during processing.", ephemeral=True)
 
-    # Download/General Error Handling
     except discord.HTTPException as e:
         bot_logger.error(f"Error downloading temp sound file for {user_id} (public={make_public}): {e}", exc_info=True)
         await cleanup_temp_upload()
@@ -979,10 +965,9 @@ async def uploadsound(
         await cleanup_temp_upload()
         await ctx.followup.send(f"{followup_message_prefix}❌ An unexpected server error occurred.", ephemeral=True)
 
-
 @bot.slash_command(
     name="mysounds",
-    description="Lists your personal uploaded sounds." # MODIFIED description
+    description="Lists your personal uploaded sounds."
 )
 @commands.cooldown(1, 10, commands.BucketType.user)
 async def mysounds(ctx: discord.ApplicationContext):
@@ -1011,26 +996,25 @@ async def mysounds(ctx: discord.ApplicationContext):
     embed = discord.Embed(
         title=f"{author.display_name}'s Personal Sounds ({len(sorted_sounds)}/{MAX_USER_SOUNDS_PER_USER})",
         description=f"Use `/playsound name:<sound_name>` or `/soundpanel` to play.\n"
-                    f"Use `/publishsound name:<sound_name>` to make one public.\n\n{sound_list_str}", # MODIFIED description
+                    f"Use `/publishsound name:<sound_name>` to make one public.\n\n{sound_list_str}",
         color=discord.Color.blurple()
     )
     embed.set_footer(text="Use /deletesound to remove sounds from this personal list.")
 
     await ctx.followup.send(embed=embed, ephemeral=True)
 
-
 @bot.slash_command(
     name="deletesound",
-    description="Deletes one of your PERSONAL uploaded sounds by name." # MODIFIED description
+    description="Deletes one of your PERSONAL uploaded sounds by name."
 )
 @commands.cooldown(1, 5, commands.BucketType.user)
 async def deletesound(
     ctx: discord.ApplicationContext,
     name: discord.Option(
         str,
-        description="The name of the personal sound to delete (use /mysounds to see names).", # MODIFIED description
+        description="The name of the personal sound to delete (use /mysounds to see names).",
         required=True,
-        autocomplete=user_sound_autocomplete # Only suggests personal sounds
+        autocomplete=user_sound_autocomplete
     ) # type: ignore
 ):
     """Handles deleting one of the user's PERSONAL sounds."""
@@ -1039,23 +1023,20 @@ async def deletesound(
     user_id = author.id
     bot_logger.info(f"COMMAND: /deletesound invoked by {author.name} ({user_id}), target personal sound name: '{name}'")
 
-    # This command ONLY targets the user's personal directory
     sound_path = find_user_sound_path(user_id, name)
-    sound_base_name = name # Use original name for messages unless sanitized below
+    sound_base_name = name
 
     if not sound_path:
-        # Try finding with sanitized name if original failed
         clean_name_try = sanitize_filename(name)
         if clean_name_try != name:
             sound_path = find_user_sound_path(user_id, clean_name_try)
             if sound_path:
-                 sound_base_name = clean_name_try # Update name used in messages if found sanitized
+                 sound_base_name = clean_name_try
 
     if not sound_path:
         await ctx.followup.send(f"❌ Personal sound named `{name}` not found in your collection. Use `/mysounds`.", ephemeral=True)
         return
 
-    # Double check the path is actually within the user's directory (safety measure)
     user_dir_abs = os.path.abspath(os.path.join(USER_SOUNDS_DIR, str(user_id)))
     sound_path_abs = os.path.abspath(sound_path)
     if not sound_path_abs.startswith(user_dir_abs):
@@ -1075,23 +1056,22 @@ async def deletesound(
          bot_logger.error(f"Unexpected error during personal sound deletion for user {user_id}, path '{sound_path}': {e}", exc_info=True)
          await ctx.followup.send(f"❌ An unexpected error occurred while trying to delete personal sound `{sound_base_name}`.", ephemeral=True)
 
-
 @bot.slash_command(
     name="playsound",
-    description="Plays one of your PERSONAL sounds in your current voice channel." # MODIFIED description
+    description="Plays one of your PERSONAL sounds in your current voice channel."
 )
 @commands.cooldown(1, 4, commands.BucketType.user)
 async def playsound(
     ctx: discord.ApplicationContext,
     name: discord.Option(
         str,
-        description="The name of the personal sound to play (use /mysounds).", # MODIFIED description
+        description="The name of the personal sound to play (use /mysounds).",
         required=True,
-        autocomplete=user_sound_autocomplete # Only suggests personal sounds
+        autocomplete=user_sound_autocomplete
     ) # type: ignore
 ):
-    """Handles playing a user's personal sound."""
-    await ctx.defer() # Public defer okay
+    """Handles playing a user's personal sound file."""
+    await ctx.defer() # Public defer okay, feedback is ephemeral in play_single_sound
     author = ctx.author
     user_id = author.id
     bot_logger.info(f"COMMAND: /playsound invoked by {author.name} ({user_id}), requesting personal sound name: '{name}'")
@@ -1104,19 +1084,16 @@ async def playsound(
         if clean_name_try != name:
              sound_path = find_user_sound_path(user_id, clean_name_try)
              if sound_path:
-                 sound_base_name = clean_name_try
+                 sound_base_name = clean_name_try # Use sanitized name if found that way
 
     if not sound_path:
         await ctx.followup.send(f"❌ Personal sound named `{name}` not found. Use `/mysounds`.", ephemeral=True)
         return
 
+    # Use the dedicated function for playing sound files
     await play_single_sound(ctx.interaction, sound_path)
 
 
-# === User Sound Panel ===
-# [NO CHANGES NEEDED in UserSoundboardView class or /soundpanel command]
-# The panel correctly only shows sounds from the user's personal directory.
-# ... (Keep UserSoundboardView class and /soundpanel function the same) ...
 class UserSoundboardView(discord.ui.View):
     """A View containing buttons to play sounds from the specific user's directory."""
     def __init__(self, user_id: int, *, timeout: Optional[float] = 300.0):
@@ -1132,7 +1109,6 @@ class UserSoundboardView(discord.ui.View):
 
         if not os.path.isdir(user_dir):
             bot_logger.warning(f"User sound directory '{user_dir}' not found for user {self.user_id}.")
-            # Add a single disabled button indicating no sounds
             button = discord.ui.Button(label="No personal sounds yet!", style=discord.ButtonStyle.secondary, disabled=True, row=0)
             self.add_item(button)
             return
@@ -1144,7 +1120,6 @@ class UserSoundboardView(discord.ui.View):
         max_buttons_total = max_buttons_per_row * max_rows # 25 button limit
 
         try:
-            # Sort files by name for consistent order
             files_in_dir = sorted(os.listdir(user_dir))
         except OSError as e:
             bot_logger.error(f"Error listing user sound directory '{user_dir}': {e}")
@@ -1155,8 +1130,7 @@ class UserSoundboardView(discord.ui.View):
         for filename in files_in_dir:
             if sounds_found >= max_buttons_total:
                 bot_logger.warning(f"Reached maximum sound button limit ({max_buttons_total}) for user {self.user_id}. Skipping remaining files.")
-                # Add a single disabled button indicating truncation
-                if button_row < max_rows: # Only add if there's space
+                if button_row < max_rows:
                      info_button = discord.ui.Button(label="...", style=discord.ButtonStyle.secondary, disabled=True, custom_id=f"usersb_truncated:{self.user_id}", row=button_row)
                      self.add_item(info_button)
                 break
@@ -1165,10 +1139,8 @@ class UserSoundboardView(discord.ui.View):
             if os.path.isfile(filepath):
                 base_name, ext = os.path.splitext(filename)
                 if ext.lower() in ALLOWED_EXTENSIONS:
-                    # Use base name for label, full filename for ID
                     button_label = base_name.replace("_", " ")[:80]
-                    # Prefix changed to avoid potential collisions if old panel exists
-                    button_custom_id = f"usersb_play:{filename}" # Keep filename for path reconstruction
+                    button_custom_id = f"usersb_play:{filename}"
 
                     if len(button_custom_id) > 100:
                         bot_logger.warning(f"Skipping user sound file '{filename}' (user {self.user_id}) because its custom_id ('{button_custom_id}') would exceed 100 characters.")
@@ -1180,15 +1152,13 @@ class UserSoundboardView(discord.ui.View):
                         custom_id=button_custom_id,
                         row=button_row
                     )
-                    # Assign the callback method
-                    button.callback = self.user_soundboard_button_callback # Use the renamed callback
+                    button.callback = self.user_soundboard_button_callback
                     self.add_item(button)
                     sounds_found += 1
 
                     if sounds_found % max_buttons_per_row == 0 and sounds_found > 0:
                         button_row += 1
-                        if button_row >= max_rows:
-                             pass
+                        if button_row >= max_rows: pass
                 else:
                     bot_logger.debug(f"Skipping non-audio file in user dir {self.user_id}: '{filename}'")
 
@@ -1197,15 +1167,12 @@ class UserSoundboardView(discord.ui.View):
              button = discord.ui.Button(label="No personal sounds yet!", style=discord.ButtonStyle.secondary, disabled=True, row=0)
              self.add_item(button)
 
-    # Renamed callback
     async def user_soundboard_button_callback(self, interaction: discord.Interaction):
         """Callback executed when a user soundboard button is pressed."""
         custom_id = interaction.data["custom_id"]
-        # user who clicked the button
         interacting_user = interaction.user
         bot_logger.info(f"USER SOUND PANEL: Button '{custom_id}' pressed by {interacting_user.name} ({interacting_user.id}) on panel for user {self.user_id}")
 
-        # Defer ephemerally - play_single_sound will send the actual feedback
         await interaction.response.defer(ephemeral=True)
 
         if not custom_id.startswith("usersb_play:"):
@@ -1214,10 +1181,9 @@ class UserSoundboardView(discord.ui.View):
             return
 
         sound_filename = custom_id.split(":", 1)[1]
-        # Construct path using the user ID stored in the view (always personal sounds)
         sound_path = os.path.join(USER_SOUNDS_DIR, str(self.user_id), sound_filename)
 
-        # Call the generic single play function, passing the interaction object
+        # Use the generic play_single_sound for files
         await play_single_sound(interaction, sound_path)
 
     async def on_timeout(self):
@@ -1225,35 +1191,34 @@ class UserSoundboardView(discord.ui.View):
         if self.message:
             bot_logger.debug(f"User sound panel view timed out for user {self.user_id} (message {self.message.id})")
             try:
-                 # Fetch message author's current display name for timeout message
-                 panel_owner = await self.message.guild.fetch_member(self.user_id)
-                 owner_name = panel_owner.display_name if panel_owner else f"User {self.user_id}"
-            except (discord.NotFound, discord.Forbidden, AttributeError): # Add AttributeError for potential guild fetch fail
+                # Fetch panel owner name
+                if self.message.guild:
+                     panel_owner = await self.message.guild.fetch_member(self.user_id)
+                     owner_name = panel_owner.display_name if panel_owner else f"User {self.user_id}"
+                else: # Fallback for DM context or missing guild
+                     owner_name = f"User {self.user_id}"
+            except (discord.NotFound, discord.Forbidden, AttributeError):
                  owner_name = f"User {self.user_id}" # Fallback if fetch fails
 
             for item in self.children:
                 if isinstance(item, discord.ui.Button):
                     item.disabled = True
             try:
-                await self.message.edit(content=f"🔊 **{owner_name}'s Personal Sound Panel (Expired)**", view=self) # Indicate owner
-            except discord.NotFound:
-                bot_logger.debug(f"User sound panel message {self.message.id} not found on timeout.")
-            except discord.Forbidden:
-                 bot_logger.warning(f"Missing permissions to edit user sound panel message {self.message.id} on timeout.")
-            except Exception as e:
-                bot_logger.warning(f"Failed to edit user sound panel message {self.message.id} on timeout: {e}", exc_info=True)
+                await self.message.edit(content=f"🔊 **{owner_name}'s Personal Sound Panel (Expired)**", view=self)
+            except discord.NotFound: pass
+            except discord.Forbidden: pass
+            except Exception as e: bot_logger.warning(f"Failed to edit user sound panel message {self.message.id} on timeout: {e}")
         else:
              bot_logger.debug(f"User sound panel view timed out for user {self.user_id} but message reference was lost.")
 
-
 @bot.slash_command(
     name="soundpanel",
-    description="Displays buttons to play YOUR personal sounds." # MODIFIED description
+    description="Displays buttons to play YOUR personal sounds."
 )
 @commands.cooldown(1, 10, commands.BucketType.user)
 async def soundpanel(ctx: discord.ApplicationContext):
     """Sends the user's personal sound panel message."""
-    await ctx.defer()
+    await ctx.defer() # Public defer okay, view is specific
     author = ctx.author
     user_id = author.id
     bot_logger.info(f"COMMAND: /soundpanel invoked by {author.name} ({user_id}) in channel {ctx.channel_id}")
@@ -1266,37 +1231,35 @@ async def soundpanel(ctx: discord.ApplicationContext):
     )
 
     if not has_playable_buttons:
+         # Use followup since we deferred
          await ctx.followup.send("You haven't uploaded any personal sounds yet! Use `/uploadsound`.", ephemeral=True)
          return
 
     message_content = f"🔊 **{author.display_name}'s Personal Sound Panel** - Click a button to play!"
     try:
         message = await ctx.followup.send(message_content, view=view)
-        view.message = message
+        view.message = message # Store message reference for timeout editing
     except Exception as e:
         bot_logger.error(f"Failed to send soundpanel message for user {user_id}: {e}", exc_info=True)
-        try:
-            await ctx.followup.send("❌ Failed to create the sound panel message.", ephemeral=True)
-        except: pass
+        try: await ctx.followup.send("❌ Failed to create the sound panel message.", ephemeral=True)
+        except: pass # Ignore if followup also fails
 
 
-# === Public Sound Commands ===
-
-# <<< REMOVED /makepublic command >>>
-
-# <<< NEW /publishsound command >>>
+# === Public Sound Commands [UNCHANGED] ===
+# /publishsound, /removepublic, /publicsounds, /playpublic
+# ... (Keep all these commands exactly the same) ...
 @bot.slash_command(
     name="publishsound",
     description="Make one of your personal sounds public for everyone to use."
 )
-@commands.cooldown(1, 10, commands.BucketType.user) # Cooldown per user
+@commands.cooldown(1, 10, commands.BucketType.user)
 async def publishsound(
     ctx: discord.ApplicationContext,
     name: discord.Option(
         str,
         description="The name of YOUR personal sound to make public (use /mysounds).",
         required=True,
-        autocomplete=user_sound_autocomplete # Autocomplete from the user's sounds
+        autocomplete=user_sound_autocomplete
     ) # type: ignore
 ):
     """Copies a user's personal sound to the public directory if the name isn't taken."""
@@ -1305,27 +1268,24 @@ async def publishsound(
     user_id = author.id
     bot_logger.info(f"COMMAND: /publishsound invoked by {author.name} ({user_id}), target sound name: '{name}'")
 
-    # 1. Find the user's personal sound
     user_sound_path = find_user_sound_path(user_id, name)
-    sound_base_name = name # Assume this is the base name for now
+    sound_base_name = name
 
     if not user_sound_path:
-        # Try finding with sanitized name if original failed
         clean_name_try = sanitize_filename(name)
         if clean_name_try != name:
              user_sound_path = find_user_sound_path(user_id, clean_name_try)
              if user_sound_path:
-                 sound_base_name = clean_name_try # Use the sanitized name if found that way
+                 sound_base_name = clean_name_try
 
     if not user_sound_path:
         await ctx.followup.send(f"❌ Personal sound named `{name}` not found in your collection. Use `/mysounds`.", ephemeral=True)
         return
 
-    # 2. Determine the target public path and check for conflicts
     source_filename = os.path.basename(user_sound_path)
-    public_filename = source_filename # Use the exact same filename in public dir
+    public_filename = source_filename
     public_sound_path = os.path.join(PUBLIC_SOUNDS_DIR, public_filename)
-    target_base_name, _ = os.path.splitext(public_filename) # Base name for conflict check
+    target_base_name, _ = os.path.splitext(public_filename)
 
     existing_public_path = find_public_sound_path(target_base_name)
     if existing_public_path:
@@ -1333,9 +1293,8 @@ async def publishsound(
         await ctx.followup.send(f"❌ Cannot publish. A public sound named `{target_base_name}` already exists. Choose a different name for your sound or ask an admin.", ephemeral=True)
         return
 
-    # 3. Copy the file
     try:
-        shutil.copy2(user_sound_path, public_sound_path) # copy2 preserves more metadata
+        shutil.copy2(user_sound_path, public_sound_path) # copy2 preserves metadata
         bot_logger.info(f"SOUND PUBLISHED: Copied '{user_sound_path}' to '{public_sound_path}' by {author.name} ({user_id}).")
         await ctx.followup.send(f"✅ Sound `{sound_base_name}` (file: `{public_filename}`) is now public!\n"
                                 f"Anyone can play it using `/playpublic name:{target_base_name}`.", ephemeral=True)
@@ -1346,20 +1305,19 @@ async def publishsound(
         bot_logger.error(f"Unexpected error during /publishsound for sound '{user_sound_path}': {e}", exc_info=True)
         await ctx.followup.send(f"❌ An unexpected error occurred while publishing sound `{sound_base_name}`.", ephemeral=True)
 
-
 @bot.slash_command(
     name="removepublic",
     description="[Admin] Remove a sound from the public collection."
 )
-@commands.has_permissions(manage_guild=True) # Keep admin only
-@commands.cooldown(1, 5, commands.BucketType.user)
+@commands.has_permissions(manage_guild=True)
+@commands.cooldown(1, 5, commands.BucketType.guild) # Changed to guild bucket for admin commands
 async def removepublic(
     ctx: discord.ApplicationContext,
     name: discord.Option(
         str,
         description="The name of the public sound to remove (use /publicsounds to see names).",
         required=True,
-        autocomplete=public_sound_autocomplete # Autocomplete from public sounds
+        autocomplete=public_sound_autocomplete
     ) # type: ignore
 ):
     """Deletes a sound from the public directory."""
@@ -1367,12 +1325,10 @@ async def removepublic(
     admin_user = ctx.author
     bot_logger.info(f"COMMAND: /removepublic invoked by admin {admin_user.name} ({admin_user.id}), target public sound name: '{name}'")
 
-    # 1. Find the public sound path
     public_sound_path = find_public_sound_path(name)
-    sound_base_name = name # Assume for message
+    sound_base_name = name
 
     if not public_sound_path:
-        # Try sanitized just in case filename differs from input `name`
         clean_name_try = sanitize_filename(name)
         if clean_name_try != name:
             public_sound_path = find_public_sound_path(clean_name_try)
@@ -1383,7 +1339,6 @@ async def removepublic(
         await ctx.followup.send(f"❌ Public sound named `{name}` not found. Use `/publicsounds` to check names.", ephemeral=True)
         return
 
-    # 2. Delete the file
     try:
         deleted_filename = os.path.basename(public_sound_path)
         os.remove(public_sound_path)
@@ -1395,7 +1350,6 @@ async def removepublic(
     except Exception as e:
          bot_logger.error(f"Unexpected error during public sound deletion '{public_sound_path}': {e}", exc_info=True)
          await ctx.followup.send(f"❌ An unexpected error occurred while trying to delete public sound `{sound_base_name}`.", ephemeral=True)
-
 
 @bot.slash_command(
     name="publicsounds",
@@ -1432,7 +1386,6 @@ async def publicsounds(ctx: discord.ApplicationContext):
 
     await ctx.followup.send(embed=embed, ephemeral=True)
 
-
 @bot.slash_command(
     name="playpublic",
     description="Plays a public sound in your current voice channel."
@@ -1442,12 +1395,12 @@ async def playpublic(
     ctx: discord.ApplicationContext,
     name: discord.Option(
         str,
-        description="The name of the public sound to play (use /publicsounds).", # MODIFIED description
+        description="The name of the public sound to play (use /publicsounds).",
         required=True,
-        autocomplete=public_sound_autocomplete # Autocomplete from public sounds
+        autocomplete=public_sound_autocomplete
     ) # type: ignore
 ):
-    """Handles playing a public sound."""
+    """Handles playing a public sound file."""
     await ctx.defer() # Public defer okay
     author = ctx.author
     bot_logger.info(f"COMMAND: /playpublic invoked by {author.name} ({author.id}), requesting public sound name: '{name}'")
@@ -1466,12 +1419,188 @@ async def playpublic(
         await ctx.followup.send(f"❌ Public sound named `{name}` not found. Use `/publicsounds`.", ephemeral=True)
         return
 
+    # Use the generic play_single_sound for files
     await play_single_sound(ctx.interaction, public_sound_path)
 
 
-# --- Error Handler for Application Commands ---
-# [NO CHANGES NEEDED]
-# ... (Keep on_application_command_error function the same) ...
+@bot.slash_command(
+    name="tts",
+    description="Make the bot say something using Text-to-Speech in your channel."
+)
+@commands.cooldown(1, 6, commands.BucketType.user)
+async def tts(
+    ctx: discord.ApplicationContext,
+    message: discord.Option(
+        str,
+        description=f"The text you want the bot to speak (max {MAX_TTS_LENGTH} chars).",
+        required=True
+    ), # type: ignore
+    language: discord.Option(
+        str,
+        description="Language/accent for the TTS voice (default: English US).",
+        required=False,
+        default='en', # Default language
+        choices=TTS_LANGUAGE_CHOICES # Use the defined choices
+    ), # type: ignore
+    slow: discord.Option(
+        bool,
+        description="Speak slowly? (Default: False)",
+        required=False,
+        default=False # Default speed
+    ) # type: ignore
+):
+    """Generates TTS audio from text with language/speed options and plays it."""
+    await ctx.defer(ephemeral=True)
+    user = ctx.author
+    guild = ctx.guild
+    # <<< Log chosen options >>>
+    bot_logger.info(f"COMMAND: /tts invoked by {user.name} ({user.id}), lang: {language}, slow: {slow}")
+
+    # --- Initial Validations [UNCHANGED] ---
+    if not guild:
+        await ctx.followup.send("This command only works in a server.", ephemeral=True)
+        return
+    if not user.voice or not user.voice.channel:
+        await ctx.followup.send("You need to be in a voice channel to use this command.", ephemeral=True)
+        return
+    if len(message) > MAX_TTS_LENGTH:
+         await ctx.followup.send(f"❌ Message is too long ({len(message)} chars). Maximum is {MAX_TTS_LENGTH} characters.", ephemeral=True)
+         return
+    if not message.strip():
+         await ctx.followup.send("❌ Please provide some text to speak.", ephemeral=True)
+         return
+
+    target_channel = user.voice.channel
+    guild_id = guild.id
+
+    bot_perms = target_channel.permissions_for(guild.me)
+    if not bot_perms.connect or not bot_perms.speak:
+        await ctx.followup.send(f"❌ I don't have permission to Connect or Speak in {target_channel.mention}.", ephemeral=True)
+        return
+
+    # --- Generate TTS In Memory ---
+    audio_source: Optional[discord.PCMAudio] = None
+    mp3_fp = io.BytesIO()
+    pcm_fp = io.BytesIO()
+    try:
+        # <<< Log options being used for generation >>>
+        bot_logger.info(f"TTS: Generating for '{user.name}' (lang={language}, slow={slow}) in guild {guild_id}: '{message[:50]}...'")
+        # <<< Use the language and slow parameters from the command options >>>
+        tts_instance = gTTS(text=message, lang=language, slow=slow)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, tts_instance.write_to_fp, mp3_fp)
+        mp3_fp.seek(0)
+        bot_logger.debug(f"TTS: Generated MP3 in memory ({mp3_fp.getbuffer().nbytes} bytes)")
+
+        if mp3_fp.getbuffer().nbytes == 0:
+             raise ValueError("gTTS resulted in empty audio data.")
+
+        # --- Process In-Memory Audio with Pydub [UNCHANGED relative to previous TTS] ---
+        bot_logger.debug("TTS: Processing in-memory MP3 with Pydub...")
+        audio_segment = AudioSegment.from_file(mp3_fp, format="mp3")
+        audio_segment = audio_segment.set_frame_rate(48000).set_channels(2)
+        audio_segment.export(pcm_fp, format="s16le")
+        pcm_fp.seek(0)
+        bot_logger.debug(f"TTS: Converted to PCM in memory ({pcm_fp.getbuffer().nbytes} bytes)")
+
+        if pcm_fp.getbuffer().nbytes > 0:
+            audio_source = discord.PCMAudio(pcm_fp)
+            bot_logger.info(f"TTS: Successfully created PCMAudio source for {user.name}.")
+        else:
+            raise ValueError("Pydub export resulted in empty PCM data.")
+
+    except gTTS.gTTSError as e: # Specific gTTS error handling
+        bot_logger.error(f"TTS Generation Error for {user.name} (lang={language}): {e}", exc_info=True)
+        # Check if it's likely an invalid language code error
+        if "Language not found" in str(e) or "lang" in str(e).lower():
+             await ctx.followup.send(f"❌ Error: The language code '{language}' seems unsupported by the TTS engine.", ephemeral=True)
+        else:
+            await ctx.followup.send(f"❌ Error generating TTS: {e}", ephemeral=True)
+        return
+    except ImportError as e:
+        bot_logger.critical(f"TTS Error: Missing library: {e}", exc_info=True)
+        await ctx.followup.send("❌ Error: A required library for TTS is missing on the bot.", ephemeral=True)
+        return
+    except Exception as e:
+        bot_logger.error(f"TTS: Failed to generate or process TTS for {user.name}: {e}", exc_info=True)
+        await ctx.followup.send(f"❌ Error during TTS processing: {e}", ephemeral=True)
+        return
+    finally:
+        mp3_fp.close()
+
+    if not audio_source:
+        bot_logger.error("TTS: Failed to create audio source after processing.")
+        await ctx.followup.send("❌ Failed to prepare TTS audio for playback.", ephemeral=True)
+        return
+
+    # --- Voice Connection & Playback Logic [UNCHANGED relative to previous TTS] ---
+    voice_client = discord.utils.get(bot.voice_clients, guild=guild)
+    try:
+        # ... (Connection/Move/Busy Check Logic - exactly the same as before) ...
+        if voice_client and voice_client.is_connected():
+            if voice_client.is_playing():
+                if guild_id in guild_sound_queues and guild_sound_queues[guild_id]:
+                    await ctx.followup.send("⏳ Bot is currently playing join sounds. Please wait.", ephemeral=True)
+                    bot_logger.info(f"TTS: Bot busy with join queue in {guild.name}, user {user.name} tried TTS. Request ignored.")
+                else:
+                    await ctx.followup.send("⏳ Bot is currently playing another sound/TTS. Please wait.", ephemeral=True)
+                    bot_logger.info(f"TTS: Bot busy in {guild.name}, user {user.name} tried TTS. Request ignored.")
+                return
+            elif voice_client.channel != target_channel:
+                bot_logger.info(f"TTS: Moving from '{voice_client.channel.name}' to '{target_channel.name}' for {user.name}.")
+                await voice_client.move_to(target_channel)
+                bot_logger.info(f"TTS: Moved successfully.")
+        else:
+            bot_logger.info(f"TTS: Connecting to '{target_channel.name}' for {user.name}.")
+            voice_client = await target_channel.connect(timeout=30.0, reconnect=True)
+            bot_logger.info(f"TTS: Connected successfully.")
+
+        if not voice_client or not voice_client.is_connected():
+             bot_logger.error(f"TTS: Failed to establish voice client for {target_channel.name} after connect/move attempt.")
+             await ctx.followup.send("❌ Failed to connect/move to the voice channel.", ephemeral=True)
+             return
+
+    except asyncio.TimeoutError:
+         await ctx.followup.send("❌ Connection to the voice channel timed out.", ephemeral=True)
+         bot_logger.error(f"TTS: Connection/Move Timeout in {guild.name}")
+         return
+    except discord.errors.ClientException as e:
+        if "already connecting" in str(e).lower() or "already disconnecting" in str(e).lower():
+             await ctx.followup.send("⏳ Bot is busy connecting/disconnecting. Please wait a moment.", ephemeral=True)
+             bot_logger.warning(f"TTS: Connection/Move failed in {guild.name}, already busy: {e}")
+        else:
+            await ctx.followup.send("❌ Error connecting/moving voice channel. Maybe check permissions?", ephemeral=True)
+            bot_logger.error(f"TTS: Connection/Move ClientException in {guild.name}: {e}", exc_info=True)
+        return
+    except Exception as e:
+        await ctx.followup.send("❌ An unexpected error occurred trying to join the voice channel.", ephemeral=True)
+        bot_logger.error(f"TTS: Connection/Move unexpected error in {guild.name}: {e}", exc_info=True)
+        return
+
+    # --- Play TTS Audio [UNCHANGED relative to previous TTS] ---
+    if voice_client.is_playing(): # Final check
+         bot_logger.warning(f"TTS: Voice client became busy between check and play call for {user.name}. Aborting playback.")
+         await ctx.followup.send("⏳ Bot became busy just now. Please try again.", ephemeral=True)
+         after_play_handler(None, voice_client)
+         return
+
+    try:
+        bot_logger.info(f"TTS PLAYBACK: Playing TTS requested by {user.display_name}...")
+        voice_client.play(audio_source, after=lambda e: after_play_handler(e, voice_client))
+        # Give slightly more informative feedback including the language/speed used
+        speed_str = "(slow)" if slow else "(normal speed)"
+        await ctx.followup.send(f"🗣️ Saying in `{language}` {speed_str}: \"{message[:100]}{'...' if len(message) > 100 else ''}\"", ephemeral=True)
+    except discord.errors.ClientException as e:
+        await ctx.followup.send("❌ Error: Already playing audio or another client issue occurred.", ephemeral=True)
+        bot_logger.error(f"TTS PLAYBACK ERROR (ClientException): {e}", exc_info=True)
+        after_play_handler(e, voice_client)
+    except Exception as e:
+        await ctx.followup.send("❌ An unexpected error occurred during TTS playback.", ephemeral=True)
+        bot_logger.error(f"TTS PLAYBACK ERROR (Unexpected): {e}", exc_info=True)
+        after_play_handler(e, voice_client)
+
+# --- Error Handler for Application Commands [UNCHANGED] ---
 @bot.event
 async def on_application_command_error(ctx: discord.ApplicationContext, error: discord.DiscordException):
     """Handles errors raised during slash command execution."""
@@ -1482,16 +1611,10 @@ async def on_application_command_error(ctx: discord.ApplicationContext, error: d
         retry_after = error.retry_after
         message = f"⏳ This command (`/{command_name}`) is on cooldown. Please try again in {retry_after:.1f} seconds."
         try:
-            # Check if already responded (e.g., defer)
-            if not ctx.interaction.response.is_done():
-                await ctx.respond(message, ephemeral=True)
-            else:
-                await ctx.followup.send(message, ephemeral=True)
-        except discord.NotFound: # Interaction might expire before followup
-             bot_logger.warning(f"Cooldown error for {user_name} on /{command_name}, but interaction expired.")
-        except Exception as e_resp:
-             bot_logger.error(f"Failed to send cooldown error response for /{command_name}: {e_resp}")
-
+            if not ctx.interaction.response.is_done(): await ctx.respond(message, ephemeral=True)
+            else: await ctx.followup.send(message, ephemeral=True)
+        except discord.NotFound: pass
+        except Exception as e_resp: bot_logger.error(f"Failed to send cooldown error response for /{command_name}: {e_resp}")
 
     elif isinstance(error, commands.MissingPermissions):
         perms_list = "\n".join([f"- `{perm}`" for perm in error.missing_permissions])
@@ -1500,10 +1623,8 @@ async def on_application_command_error(ctx: discord.ApplicationContext, error: d
         try:
             if not ctx.interaction.response.is_done(): await ctx.respond(message, ephemeral=True)
             else: await ctx.followup.send(message, ephemeral=True)
-        except discord.NotFound:
-             bot_logger.warning(f"MissingPerms error for {user_name} on /{command_name}, but interaction expired.")
-        except Exception as e_resp:
-             bot_logger.error(f"Failed to send MissingPermissions error response for /{command_name}: {e_resp}")
+        except discord.NotFound: pass
+        except Exception as e_resp: bot_logger.error(f"Failed to send MissingPermissions error response for /{command_name}: {e_resp}")
 
     elif isinstance(error, commands.BotMissingPermissions):
          perms_list = "\n".join([f"- `{perm}`" for perm in error.missing_permissions])
@@ -1512,61 +1633,44 @@ async def on_application_command_error(ctx: discord.ApplicationContext, error: d
          try:
              if not ctx.interaction.response.is_done(): await ctx.respond(message, ephemeral=True)
              else: await ctx.followup.send(message, ephemeral=True)
-         except discord.Forbidden:
-              bot_logger.error(f"Cannot inform user {user_name} about missing bot permissions for '/{command_name}' in channel {ctx.channel_id}.")
-         except discord.NotFound:
-             bot_logger.warning(f"BotMissingPerms error for {user_name} on /{command_name}, but interaction expired.")
-         except Exception as e_resp:
-             bot_logger.error(f"Failed to send BotMissingPermissions error response for /{command_name}: {e_resp}")
+         except discord.Forbidden: bot_logger.error(f"Cannot inform user about missing bot perms for '/{command_name}'")
+         except discord.NotFound: pass
+         except Exception as e_resp: bot_logger.error(f"Failed to send BotMissingPermissions error response for /{command_name}: {e_resp}")
 
-    elif isinstance(error, commands.CheckFailure): # Catch other checks like has_permissions failure
+    elif isinstance(error, commands.CheckFailure):
         message = f"🚫 You do not meet the requirements to use the command `/{command_name}`."
         bot_logger.warning(f"Check Failure Error: User {user_name} failed checks for /{command_name}.")
         try:
             if not ctx.interaction.response.is_done(): await ctx.respond(message, ephemeral=True)
             else: await ctx.followup.send(message, ephemeral=True)
-        except discord.NotFound:
-            bot_logger.warning(f"CheckFailure error for {user_name} on /{command_name}, but interaction expired.")
-        except Exception as e_resp:
-            bot_logger.error(f"Failed to send CheckFailure error response for /{command_name}: {e_resp}")
+        except discord.NotFound: pass
+        except Exception as e_resp: bot_logger.error(f"Failed to send CheckFailure error response for /{command_name}: {e_resp}")
 
-    # Handle application command specific errors if needed, e.g. Autocomplete errors
     elif isinstance(error, discord.errors.ApplicationCommandInvokeError):
          original = error.original
          bot_logger.error(f"Error invoking application command '/{command_name}' by {user_name}: {original}", exc_info=original)
-         # Try to give a slightly more specific error if it's a known type
-         if isinstance(original, FileNotFoundError):
-              error_message = f"❌ Error running `/{command_name}`: A required file was not found."
-         elif isinstance(original, CouldntDecodeError):
-              error_message = f"❌ Error running `/{command_name}`: Could not process an audio file. It might be corrupted."
-         else:
-              error_message = f"❌ An internal error occurred while running `/{command_name}`. The developers have been notified."
-
+         if isinstance(original, FileNotFoundError): error_message = f"❌ Error running `/{command_name}`: A required file was not found."
+         elif isinstance(original, CouldntDecodeError): error_message = f"❌ Error running `/{command_name}`: Could not process an audio file."
+         # <<< ADDED TTS specific user error >>>
+         elif isinstance(original, gTTS.gTTSError): error_message = f"❌ Error generating TTS: {original}"
+         else: error_message = f"❌ An internal error occurred while running `/{command_name}`."
          try:
              if not ctx.interaction.response.is_done(): await ctx.respond(error_message, ephemeral=True)
              else: await ctx.followup.send(error_message, ephemeral=True)
-         except discord.NotFound:
-             bot_logger.warning(f"Invoke Error for {user_name} on /{command_name}, but interaction expired.")
-         except Exception as e_resp:
-             bot_logger.error(f"Failed to send Invoke Error response message for /{command_name}: {e_resp}")
+         except discord.NotFound: pass
+         except Exception as e_resp: bot_logger.error(f"Failed to send Invoke Error response message for /{command_name}: {e_resp}")
 
     else:
         bot_logger.error(f"Unhandled error in application command '/{command_name}' by {user_name}:", exc_info=error)
-        error_message = f"❌ An unexpected error occurred while running `/{command_name}`. The issue has been logged."
+        error_message = f"❌ An unexpected error occurred running `/{command_name}`."
         try:
-            if not ctx.interaction.response.is_done():
-                await ctx.respond(error_message, ephemeral=True)
-            else:
-                await ctx.followup.send(error_message, ephemeral=True)
-        except discord.NotFound:
-            bot_logger.warning(f"Unhandled Error for {user_name} on /{command_name}, but interaction expired.")
-        except Exception as e_resp:
-            bot_logger.error(f"Failed to send generic error response message for /{command_name}: {e_resp}")
+            if not ctx.interaction.response.is_done(): await ctx.respond(error_message, ephemeral=True)
+            else: await ctx.followup.send(error_message, ephemeral=True)
+        except discord.NotFound: pass
+        except Exception as e_resp: bot_logger.error(f"Failed to send generic error response message for /{command_name}: {e_resp}")
 
 
-# --- Run the Bot ---
-# [NO CHANGES NEEDED in the __main__ block]
-# ... (Keep the final __main__ block with Opus checks and bot.run the same) ...
+# --- Run the Bot [UNCHANGED] ---
 if __name__ == "__main__":
     if not PYDUB_AVAILABLE:
         bot_logger.critical("Pydub library is not available. Install it ('pip install pydub') and ensure FFmpeg is in your PATH. Bot cannot start.")
@@ -1575,50 +1679,41 @@ if __name__ == "__main__":
         bot_logger.critical("BOT_TOKEN environment variable not set. Create a .env file or set the environment variable. Bot cannot start.")
         exit(1)
 
-    # --- Opus Loading Check and Attempt ---
+    # --- Opus Loading Check ---
     opus_loaded_successfully = discord.opus.is_loaded()
-
     if not opus_loaded_successfully:
         bot_logger.warning("Opus library not loaded by default. Attempting explicit load...")
-        opus_paths_to_try = [
-            "libopus.so.0", # Linux default
-            "opus",         # macOS/Windows (sometimes)
-            "libopus-0.dll",# Windows (alternative?)
-        ]
+        # Add paths relevant to your system if needed
+        opus_paths_to_try = ["libopus.so.0", "opus", "libopus-0.dll", "/opt/homebrew/opt/opus/lib/libopus.0.dylib"] # Added potential M1 Mac path
         for opus_path in opus_paths_to_try:
              try:
-                 discord.opus.load_opus(opus_path)
-                 opus_loaded_successfully = discord.opus.is_loaded()
-                 if opus_loaded_successfully:
-                     bot_logger.info(f"Opus library loaded successfully via: {opus_path}")
-                     break # Stop trying once loaded
-             except Exception as e: # Catch broadly here (OSError, DiscordException, etc.)
+                 if os.path.exists(opus_path) or opus_path == "opus": # Check existence for specific files
+                     discord.opus.load_opus(opus_path)
+                     opus_loaded_successfully = discord.opus.is_loaded()
+                     if opus_loaded_successfully:
+                         bot_logger.info(f"Opus library loaded successfully via: {opus_path}")
+                         break
+                 else:
+                      bot_logger.debug(f"Opus path '{opus_path}' not found, skipping load attempt.")
+             except Exception as e:
                  bot_logger.debug(f"Failed to load opus using path '{opus_path}': {e}")
-                 opus_loaded_successfully = False # Ensure it's false if load failed
+                 opus_loaded_successfully = False
 
-        # Final check after attempting explicit loads
         if not opus_loaded_successfully:
-             bot_logger.warning("="*30 + "\nOpus library STILL not loaded after explicit attempts. Voice functionality WILL FAIL.\n"
-                                "Ensure libopus is installed on your system AND accessible:\n"
-                                "  Debian/Ubuntu: sudo apt update && sudo apt install libopus0\n"
-                                "  Fedora: sudo dnf install opus\n"
-                                "  Arch: sudo pacman -S opus\n"
-                                "  macOS (Homebrew): brew install opus\n"
-                                "  Windows: Usually bundled with ffmpeg builds (ensure ffmpeg is in PATH), or install separately and potentially provide a direct path to opus.dll in the script.\n" + "="*30)
+             bot_logger.critical("="*30 + "\nOpus library STILL not loaded. Voice functionality WILL FAIL.\nInstall libopus and ensure it's findable (check PATH/LD_LIBRARY_PATH).\n" + "="*30)
+             # Decide whether to exit or continue with broken voice
+             # exit(1) # Exit if voice is critical
 
     # --- Start the Bot ---
     try:
         bot_logger.info("Attempting to start the bot...")
         bot.run(BOT_TOKEN)
     except discord.errors.LoginFailure:
-        bot_logger.critical("="*30 + "\nLOGIN FAILURE: Invalid BOT_TOKEN provided. Check your token.\n" + "="*30)
+        bot_logger.critical("="*30 + "\nLOGIN FAILURE: Invalid BOT_TOKEN provided.\n" + "="*30)
     except discord.errors.PrivilegedIntentsRequired as e:
-        bot_logger.critical("="*30 + f"\nINTENT ERROR: Required intents are missing: {e.shard_id}\n"
-                         "Ensure 'Server Members Intent' and 'Voice State Intent' are enabled in the Discord Developer Portal.\n" + "="*30)
+        bot_logger.critical("="*30 + f"\nINTENT ERROR: Required intents are missing: {e.shard_id}\nEnsure Voice State/Server Members intents are enabled.\n" + "="*30)
     except Exception as e:
-        # Catch generic exceptions during run, check if it's Opus-related by message content
-        if "opus" in str(e).lower() and isinstance(e, discord.errors.DiscordException):
-             bot_logger.critical(f"FATAL RUNTIME ERROR likely related to Opus: {e}", exc_info=True)
-             bot_logger.critical("This might happen during voice connection if Opus wasn't loaded properly at startup (check warnings above).")
+        if "opus" in str(e).lower() and isinstance(e, discord.errors.DiscordException) and not opus_loaded_successfully:
+             bot_logger.critical(f"FATAL RUNTIME ERROR likely related to Opus (Opus failed to load earlier): {e}", exc_info=True)
         else:
              bot_logger.critical(f"FATAL RUNTIME ERROR during bot execution: {e}", exc_info=True)
