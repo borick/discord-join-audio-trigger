@@ -11,7 +11,7 @@ import io # Required for BytesIO
 import math # For checking infinite values in dBFS
 from collections import deque # Efficient queue structure
 import re # For cleaning filenames
-from typing import List, Optional, Tuple # For type hinting
+from typing import List, Optional, Tuple, Dict, Any # For type hinting
 import shutil # For copying/moving files
 
 # Load environment variables first
@@ -39,6 +39,8 @@ MAX_USER_SOUND_SIZE_MB = 5
 MAX_USER_SOUNDS_PER_USER = 25
 ALLOWED_EXTENSIONS = ['.mp3', '.wav', '.ogg', '.m4a', '.aac']
 MAX_TTS_LENGTH = 250 # Max characters for TTS command
+DEFAULT_TTS_LANGUAGE = 'en' # Bot's default if no user pref/override
+DEFAULT_TTS_SLOW = False    # Bot's default if no user pref/override
 
 TTS_LANGUAGE_CHOICES = [ # Keep this explicit for clarity
     discord.OptionChoice(name="English (US - Default)", value="en"),
@@ -75,16 +77,27 @@ intents.message_content = False
 bot = discord.Bot(intents=intents)
 
 # --- Data Storage & Helpers ---
-user_sound_config = {}
+# User config can now store join sound and tts defaults:
+# { "user_id_str": { "join_sound": "filename.mp3", "tts_defaults": {"language": "fr", "slow": true} } }
+user_sound_config: Dict[str, Dict[str, Any]] = {}
 guild_sound_queues = {}
 guild_play_tasks = {}
 
-# --- Config/Dir Functions [UNCHANGED] ---
+# --- Config/Dir Functions ---
 def load_config():
     global user_sound_config
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r') as f: user_sound_config = json.load(f)
+            # Convert old format (just filename string) to new format (dict)
+            upgraded_count = 0
+            for user_id, data in list(user_sound_config.items()):
+                if isinstance(data, str): # Old format detected
+                    user_sound_config[user_id] = {"join_sound": data}
+                    upgraded_count += 1
+            if upgraded_count > 0:
+                bot_logger.info(f"Upgraded {upgraded_count} old user configs to new format.")
+                save_config() # Save the upgraded format immediately
             bot_logger.info(f"Loaded {len(user_sound_config)} configs from {CONFIG_FILE}")
         except (json.JSONDecodeError, Exception) as e:
              bot_logger.error(f"Error loading {CONFIG_FILE}: {e}", exc_info=True)
@@ -205,7 +218,7 @@ async def play_next_in_queue(guild: discord.Guild):
         bot_logger.warning(f"QUEUE PLAYBACK [{task_id}]: No valid source for {member.display_name} ({os.path.basename(sound_path)}). Skipping.")
         bot.loop.create_task(play_next_in_queue(guild), name=f"QueueSkip_{guild_id}")
 
-# --- on_voice_state_update [UNCHANGED] ---
+# --- on_voice_state_update [Modified for new config structure] ---
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     if member.bot or not after.channel or before.channel == after.channel: return
@@ -223,37 +236,50 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     is_tts = False
     user_id_str = str(member.id)
 
-    if user_id_str in user_sound_config:
-        filename = user_sound_config[user_id_str]
+    # --- MODIFIED PART ---
+    user_config = user_sound_config.get(user_id_str)
+    if user_config and "join_sound" in user_config:
+        filename = user_config["join_sound"]
         potential_path = os.path.join(SOUNDS_DIR, filename)
         if os.path.exists(potential_path):
             sound_path = potential_path
             bot_logger.info(f"SOUND: Using join sound: '{filename}' for {member.display_name}")
         else:
             bot_logger.warning(f"SOUND: Configured join sound '{filename}' not found. Removing broken entry, using TTS.")
-            del user_sound_config[user_id_str]
+            del user_config["join_sound"]
+            # If the user config dict is now empty, remove the user entirely
+            if not user_config:
+                del user_sound_config[user_id_str]
             save_config()
             is_tts = True
     else:
         is_tts = True
         bot_logger.info(f"SOUND: No custom join sound for {member.display_name}. Using TTS.")
+    # --- END MODIFIED PART ---
 
     if is_tts:
         tts_path = os.path.join(SOUNDS_DIR, f"tts_join_{member.id}.mp3")
         bot_logger.info(f"TTS: Generating join TTS for {member.display_name} ('{tts_path}')...")
         try:
+            # Get user's preferred TTS language for join sound, default to bot's default
+            tts_defaults = user_config.get("tts_defaults", {}) if user_config else {}
+            tts_lang = tts_defaults.get("language", DEFAULT_TTS_LANGUAGE)
+            # Join sounds are never slow
+            bot_logger.debug(f"TTS Join using lang: {tts_lang}")
+
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, lambda: gTTS(text=f"{member.display_name} joined", lang='en').save(tts_path))
+            await loop.run_in_executor(None, lambda: gTTS(text=f"{member.display_name} joined", lang=tts_lang).save(tts_path))
             bot_logger.info(f"TTS: Saved join TTS file '{tts_path}'")
             sound_path = tts_path
         except Exception as e:
             bot_logger.error(f"TTS: Failed join TTS generation for {member.display_name}: {e}", exc_info=True)
-            sound_path = None
+            sound_path = None # Fallback to silence if TTS fails
 
     if not sound_path:
         bot_logger.error(f"Could not determine/generate join sound/TTS path for {member.display_name}. Skipping.")
         return
 
+    # Rest of the function remains unchanged...
     guild_id = guild.id
     if guild_id not in guild_sound_queues: guild_sound_queues[guild_id] = deque()
     guild_sound_queues[guild_id].append((member, sound_path))
@@ -296,6 +322,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             bot_logger.info(f"VOICE: Started play task '{task_name}' for guild {guild_id}.")
         else:
              bot_logger.debug(f"VOICE: Play task for {guild_id} already running.")
+
 
 # --- after_play_handler [UNCHANGED] ---
 def after_play_handler(error: Optional[Exception], vc: discord.VoiceClient):
@@ -349,7 +376,7 @@ async def safe_disconnect(vc: Optional[discord.VoiceClient]):
     else:
          bot_logger.debug(f"Disconnect skipped for {guild.name}: Queue empty={is_join_queue_empty}, Playing={is_playing}.")
 
-# --- NEW: Voice Client Connection/Busy Check Helper ---
+# --- NEW: Voice Client Connection/Busy Check Helper [UNCHANGED] ---
 async def _ensure_voice_client_ready(interaction: discord.Interaction, target_channel: discord.VoiceChannel, action_type: str = "Playback") -> Optional[discord.VoiceClient]:
     """Helper to connect/move/check busy status and permissions. Returns VC or None."""
     guild = interaction.guild
@@ -405,7 +432,7 @@ async def _ensure_voice_client_ready(interaction: discord.Interaction, target_ch
         bot_logger.error(f"{log_prefix} Connection/Move unexpected error in {guild.name}: {e}", exc_info=True)
         return None
 
-# --- Single Sound Playback Logic (For Files) [Refactored] ---
+# --- Single Sound Playback Logic (For Files) [UNCHANGED] ---
 async def play_single_sound(interaction: discord.Interaction, sound_path: str):
     """Connects (if needed), plays a single sound FILE, and uses after_play_handler."""
     user = interaction.user
@@ -452,7 +479,7 @@ async def play_single_sound(interaction: discord.Interaction, sound_path: str):
         bot_logger.error(f"SINGLE PLAYBACK (File): Failed to get audio source for '{sound_path}'")
         if voice_client and voice_client.is_connected(): after_play_handler(None, voice_client) # Call handler even on failure
 
-# --- Helper Functions [UNCHANGED] ---
+# --- Helper Functions [UNCHANGED except autocomplete] ---
 def sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\.\s]+', '_', name)
     name = re.sub(r'_+', '_', name).strip('_')
@@ -497,25 +524,31 @@ def find_public_sound_path(sound_name: str) -> Optional[str]:
     #if not path: bot_logger.debug(f"Public sound '{sound_name}' not found")
     return path
 
-async def _generic_sound_autocomplete(ctx: discord.AutocompleteContext, source_func, *args) -> List[str]:
-    """Generic autocomplete handler."""
+# --- MODIFIED: Autocomplete Helper handles potential errors better ---
+async def _generic_sound_autocomplete(ctx: discord.AutocompleteContext, source_func, *args) -> List[discord.OptionChoice]:
+    """Generic autocomplete handler returning OptionChoices."""
     try:
         sounds = source_func(*args)
         current_value = ctx.value.lower() if ctx.value else ""
-        suggestions = sorted([name for name in sounds if current_value in name.lower()])
+        # Create OptionChoice objects for better display/handling if needed later
+        suggestions = sorted(
+            [discord.OptionChoice(name=name, value=name)
+             for name in sounds if current_value in name.lower()],
+            key=lambda choice: choice.name # Sort by name
+        )
         return suggestions[:25]
     except Exception as e:
-         bot_logger.error(f"Error during autocomplete ({source_func.__name__}): {e}", exc_info=True)
-         return []
+         bot_logger.error(f"Error during autocomplete ({source_func.__name__} for user {ctx.interaction.user.id}): {e}", exc_info=True)
+         return [] # Return empty list on error
 
-async def user_sound_autocomplete(ctx: discord.AutocompleteContext) -> List[str]:
+async def user_sound_autocomplete(ctx: discord.AutocompleteContext) -> List[discord.OptionChoice]:
     return await _generic_sound_autocomplete(ctx, get_user_sound_files, ctx.interaction.user.id)
 
-async def public_sound_autocomplete(ctx: discord.AutocompleteContext) -> List[str]:
+async def public_sound_autocomplete(ctx: discord.AutocompleteContext) -> List[discord.OptionChoice]:
     return await _generic_sound_autocomplete(ctx, get_public_sound_files)
 
 
-# --- NEW: File Upload Validation Helper ---
+# --- NEW: File Upload Validation Helper [UNCHANGED] ---
 async def _validate_and_save_upload(
     ctx: discord.ApplicationContext, # For logging user ID
     sound_file: discord.Attachment,
@@ -594,7 +627,7 @@ async def _validate_and_save_upload(
 
 # --- Slash Commands ---
 
-# === Join Sound Commands [Refactored] ===
+# === Join Sound Commands [Modified for new config structure] ===
 @bot.slash_command(name="setjoinsound", description="Upload your custom join sound. Replaces existing.")
 @commands.cooldown(1, 15, commands.BucketType.user)
 async def setjoinsound(
@@ -610,21 +643,28 @@ async def setjoinsound(
     final_save_filename = f"{user_id_str}{file_extension}"
     final_save_path = os.path.join(SOUNDS_DIR, final_save_filename)
 
+    # --- MODIFIED PART ---
+    # Get existing config or create empty dict
+    user_config = user_sound_config.get(user_id_str, {})
+    old_config_filename = user_config.get("join_sound")
+    # --- END MODIFIED PART ---
+
     # Use validation helper
     success, error_msg = await _validate_and_save_upload(ctx, sound_file, final_save_path, command_name="setjoinsound")
 
     if success:
+        # --- MODIFIED PART ---
         # Remove old sound file if config existed and filename differs
-        if user_id_str in user_sound_config:
-            old_config_filename = user_sound_config[user_id_str]
-            if old_config_filename != final_save_filename:
-                old_path = os.path.join(SOUNDS_DIR, old_config_filename)
-                if os.path.exists(old_path):
-                    try: os.remove(old_path); bot_logger.info(f"Removed previous join sound file: '{old_path}'")
-                    except Exception as e: bot_logger.warning(f"Could not remove previous join sound file '{old_path}': {e}")
+        if old_config_filename and old_config_filename != final_save_filename:
+            old_path = os.path.join(SOUNDS_DIR, old_config_filename)
+            if os.path.exists(old_path):
+                try: os.remove(old_path); bot_logger.info(f"Removed previous join sound file: '{old_path}'")
+                except Exception as e: bot_logger.warning(f"Could not remove previous join sound file '{old_path}': {e}")
 
         # Update config *after* successful save
-        user_sound_config[user_id_str] = final_save_filename
+        user_config["join_sound"] = final_save_filename # Set the join_sound key
+        user_sound_config[user_id_str] = user_config # Put the potentially updated dict back
+        # --- END MODIFIED PART ---
         save_config()
         bot_logger.info(f"Updated join sound config for {author.name} ({user_id_str}) to '{final_save_filename}'")
         await ctx.followup.send(f"✅ Success! Your join sound set to `{sound_file.filename}`.", ephemeral=True)
@@ -641,13 +681,22 @@ async def removejoinsound(ctx: discord.ApplicationContext):
     user_id_str = str(author.id)
     bot_logger.info(f"COMMAND: /removejoinsound by {author.name} ({user_id_str})")
 
-    if user_id_str in user_sound_config:
-        filename = user_sound_config.pop(user_id_str) # Remove from dict first
-        save_config()
+    # --- MODIFIED PART ---
+    user_config = user_sound_config.get(user_id_str)
+    if user_config and "join_sound" in user_config:
+        filename = user_config.pop("join_sound") # Remove key from user's dict
         bot_logger.info(f"Removed join sound config for {author.name}")
 
+        # If the user config dict is now empty, remove the user key entirely
+        if not user_config:
+            del user_sound_config[user_id_str]
+        # Otherwise, the dict (now without join_sound) remains in user_sound_config
+
+        save_config()
+    # --- END MODIFIED PART ---
+
         file_path = os.path.join(SOUNDS_DIR, filename)
-        tts_join_file = os.path.join(SOUNDS_DIR, f"tts_join_{user_id_str}.mp3")
+        tts_join_file = os.path.join(SOUNDS_DIR, f"tts_join_{user_id_str}.mp3") # Also clean up potential TTS join file
 
         for path_to_remove in [file_path, tts_join_file]:
             if os.path.exists(path_to_remove):
@@ -656,12 +705,12 @@ async def removejoinsound(ctx: discord.ApplicationContext):
             elif path_to_remove == file_path: # Log only if the main configured file was missing
                  bot_logger.warning(f"Configured join sound '{filename}' not found at '{file_path}' during removal.")
 
-        await ctx.followup.send("🗑️ Custom join sound removed. Default TTS will be used.", ephemeral=True)
+        await ctx.followup.send("🗑️ Custom join sound removed. Default TTS will be used for joins.", ephemeral=True)
     else:
         await ctx.followup.send("🤷 You don't have a custom join sound configured.", ephemeral=True)
 
 
-# === User Command Sound / Soundboard Commands [Refactored Upload] ===
+# === User Command Sound / Soundboard Commands [UNCHANGED Upload/List/Delete/Play/Panel] ===
 @bot.slash_command(name="uploadsound", description=f"Upload a sound (personal/public). Limit: {MAX_USER_SOUNDS_PER_USER}.")
 @commands.cooldown(2, 20, commands.BucketType.user)
 async def uploadsound(
@@ -801,7 +850,7 @@ async def playsound(
 
     await play_single_sound(ctx.interaction, sound_path)
 
-# --- Sound Panel View [UNCHANGED except slight logging/string format] ---
+# --- Sound Panel View [UNCHANGED] ---
 class UserSoundboardView(discord.ui.View):
     def __init__(self, user_id: int, *, timeout: Optional[float] = 300.0):
         super().__init__(timeout=timeout)
@@ -1015,19 +1064,80 @@ async def playpublic(
 
     await play_single_sound(ctx.interaction, public_path)
 
-# === TTS Command [Refactored] ===
+
+# === NEW: TTS Defaults Commands ===
+@bot.slash_command(name="setttsdefaults", description="Set your preferred default TTS language and speed.")
+@commands.cooldown(1, 10, commands.BucketType.user)
+async def setttsdefaults(
+    ctx: discord.ApplicationContext,
+    language: discord.Option(str, description="Your preferred default language/accent.", required=True, choices=TTS_LANGUAGE_CHOICES), # type: ignore
+    slow: discord.Option(bool, description="Speak slowly by default?", required=True) # type: ignore
+):
+    await ctx.defer(ephemeral=True)
+    author = ctx.author
+    user_id_str = str(author.id)
+    bot_logger.info(f"COMMAND: /setttsdefaults by {author.name} ({user_id_str}), lang: {language}, slow: {slow}")
+
+    # Get user's config dict, creating it if it doesn't exist
+    user_config = user_sound_config.setdefault(user_id_str, {})
+
+    # Set or update the tts_defaults key
+    user_config['tts_defaults'] = {'language': language, 'slow': slow}
+
+    save_config()
+    lang_name = next((choice.name for choice in TTS_LANGUAGE_CHOICES if choice.value == language), language) # Get friendly name
+    await ctx.followup.send(
+        f"✅ Your TTS defaults are now:\n"
+        f"- Language: **{lang_name}** (`{language}`)\n"
+        f"- Slow: **{slow}**\n"
+        f"These will be used for `/tts` unless you specify options.",
+        ephemeral=True
+    )
+
+@bot.slash_command(name="removettsdefaults", description="Remove your custom TTS language/speed defaults.")
+@commands.cooldown(1, 5, commands.BucketType.user)
+async def removettsdefaults(ctx: discord.ApplicationContext):
+    await ctx.defer(ephemeral=True)
+    author = ctx.author
+    user_id_str = str(author.id)
+    bot_logger.info(f"COMMAND: /removettsdefaults by {author.name} ({user_id_str})")
+
+    user_config = user_sound_config.get(user_id_str)
+
+    if user_config and 'tts_defaults' in user_config:
+        del user_config['tts_defaults']
+        bot_logger.info(f"Removed TTS defaults for {author.name}")
+
+        # If the user config dict is now empty (no join sound either), remove user key
+        if not user_config:
+            del user_sound_config[user_id_str]
+            bot_logger.info(f"Removed empty user config entry for {author.name}")
+
+        save_config()
+        await ctx.followup.send(
+            f"🗑️ Your custom TTS defaults have been removed.\n"
+            f"The bot will now use default language (`{DEFAULT_TTS_LANGUAGE}`) and speed (`{DEFAULT_TTS_SLOW}`) unless you specify options in `/tts`.",
+            ephemeral=True
+        )
+    else:
+        await ctx.followup.send("🤷 You don't have any custom TTS defaults set.", ephemeral=True)
+
+
+# === TTS Command [MODIFIED for Defaults] ===
 @bot.slash_command(name="tts", description="Make the bot say something using Text-to-Speech.")
 @commands.cooldown(1, 6, commands.BucketType.user)
 async def tts(
     ctx: discord.ApplicationContext,
     message: discord.Option(str, description=f"Text to speak (max {MAX_TTS_LENGTH} chars).", required=True), # type: ignore
-    language: discord.Option(str, description="Language/accent (default: en).", default='en', choices=TTS_LANGUAGE_CHOICES), # type: ignore
-    slow: discord.Option(bool, description="Speak slowly? (Default: False)", default=False) # type: ignore
+    language: discord.Option(str, description="Override language (uses your default otherwise).", required=False, choices=TTS_LANGUAGE_CHOICES), # type: ignore
+    slow: discord.Option(bool, description="Override slow speech (uses your default otherwise).", required=False) # type: ignore
 ):
     await ctx.defer(ephemeral=True)
     user = ctx.author
     guild = ctx.guild
-    bot_logger.info(f"COMMAND: /tts by {user.name} ({user.id}), lang: {language}, slow: {slow}")
+    user_id_str = str(user.id)
+    # Log requested overrides (will be None if not provided)
+    bot_logger.info(f"COMMAND: /tts by {user.name} ({user_id_str}), explicit lang: {language}, explicit slow: {slow}")
 
     # Initial Validations
     if not guild or not user.voice or not user.voice.channel:
@@ -1039,12 +1149,25 @@ async def tts(
 
     target_channel = user.voice.channel
 
+    # --- Determine final TTS settings ---
+    user_config = user_sound_config.get(user_id_str, {})
+    saved_defaults = user_config.get("tts_defaults", {})
+
+    # Use explicit option if provided, otherwise saved default, otherwise bot default
+    final_language = language if language is not None else saved_defaults.get('language', DEFAULT_TTS_LANGUAGE)
+    final_slow = slow if slow is not None else saved_defaults.get('slow', DEFAULT_TTS_SLOW)
+
+    source_info = "explicit" if language is not None else ("saved" if 'language' in saved_defaults else "default")
+    source_info_slow = "explicit" if slow is not None else ("saved" if 'slow' in saved_defaults else "default")
+    bot_logger.info(f"TTS Final Settings for {user.name}: lang={final_language} ({source_info}), slow={final_slow} ({source_info_slow})")
+    # --- End settings determination ---
+
     # Generate TTS In Memory
     audio_source: Optional[discord.PCMAudio] = None
     pcm_fp = io.BytesIO() # Only need PCM BytesIO now
     try:
-        bot_logger.info(f"TTS: Generating for '{user.name}' (lang={language}, slow={slow}): '{message[:50]}...'")
-        tts_instance = gTTS(text=message, lang=language, slow=slow)
+        bot_logger.info(f"TTS: Generating for '{user.name}' (lang={final_language}, slow={final_slow}): '{message[:50]}...'")
+        tts_instance = gTTS(text=message, lang=final_language, slow=final_slow)
 
         # Use run_in_executor for both gTTS and Pydub processing
         loop = asyncio.get_running_loop()
@@ -1065,9 +1188,9 @@ async def tts(
         bot_logger.info(f"TTS: Successfully created PCMAudio source for {user.name}.")
 
     except gTTSError as e:
-        msg = f"❌ TTS Error: Language '{language}' unsupported?" if "Language not found" in str(e) else f"❌ TTS Error: {e}"
+        msg = f"❌ TTS Error: Language '{final_language}' unsupported?" if "Language not found" in str(e) else f"❌ TTS Error: {e}"
         await ctx.followup.send(msg, ephemeral=True)
-        bot_logger.error(f"TTS Generation Error for {user.name} (lang={language}): {e}", exc_info=True)
+        bot_logger.error(f"TTS Generation Error for {user.name} (lang={final_language}): {e}", exc_info=True)
         return
     except (ImportError, ValueError, Exception) as e: # Catch Pydub/other errors
         err_type = type(e).__name__
@@ -1100,8 +1223,11 @@ async def tts(
         bot_logger.info(f"TTS PLAYBACK: Playing TTS requested by {user.display_name}...")
         # Pass pcm_fp to close automatically after playback using a lambda in after
         voice_client.play(audio_source, after=lambda e: (after_play_handler(e, voice_client), pcm_fp.close()))
-        speed_str = "(slow)" if slow else ""
-        await ctx.followup.send(f"🗣️ Saying in `{language}` {speed_str}: \"{message[:100]}{'...' if len(message) > 100 else ''}\"", ephemeral=True)
+
+        # Feedback message showing the *actual* settings used
+        speed_str = "(slow)" if final_slow else ""
+        lang_name = next((choice.name for choice in TTS_LANGUAGE_CHOICES if choice.value == final_language), final_language)
+        await ctx.followup.send(f"🗣️ Saying in **{lang_name}** {speed_str}: \"{message[:100]}{'...' if len(message) > 100 else ''}\"", ephemeral=True)
     except (discord.errors.ClientException, Exception) as e:
         msg = "❌ Error: Already playing or client issue." if isinstance(e, discord.errors.ClientException) else "❌ Unexpected playback error."
         await ctx.followup.send(msg, ephemeral=True)
