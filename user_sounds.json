@@ -2,7 +2,7 @@
     "1046151345922641990": {
         "join_sound": "1046151345922641990.mp3",
         "tts_defaults": {
-            "language": "es-es",
+            "language": "en-uk",
             "slow": false
         }
     },
