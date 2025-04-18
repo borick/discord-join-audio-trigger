@@ -2,11 +2,13 @@
     "1046151345922641990": {
         "join_sound": "1046151345922641990.mp3",
         "tts_defaults": {
-            "language": "en-uk",
-            "slow": false
+            "voice": "en-US-JennyNeural"
         }
     },
     "255900534702211072": {
-        "join_sound": "255900534702211072.wav"
+        "join_sound": "joinsound_255900534702211072.mp3"
+    },
+    "259062089128214541": {
+        "join_sound": "joinsound_259062089128214541.wav"
     }
 }
