@@ -88,48 +88,8 @@ class AdminCog(commands.Cog):
         """Autocomplete for public sounds."""
         return await file_helpers._generic_sound_autocomplete(ctx, file_helpers.get_public_sound_files)
 
-    @discord.slash_command(name="removepublic", description="[Admin Only] Remove a sound from the public collection.")
-    @commands.has_permissions(manage_guild=True)
-    @commands.cooldown(1, 5, commands.BucketType.guild)
-    async def removepublic(
-        self,
-        ctx: discord.ApplicationContext,
-        name: discord.Option(str, description="Name of the public sound to remove.", required=True, autocomplete=public_sound_autocomplete)
-    ):
-        """Allows server admins to remove a public sound."""
-        await ctx.defer(ephemeral=True)
-        admin = ctx.author
-        guild_id_log = ctx.guild.id if ctx.guild else "DM_Context"
-        log.info(f"COMMAND: /removepublic by admin {admin.name} ({admin.id}) (context guild: {guild_id_log}), target sound name: '{name}'")
-
-        public_path = file_helpers.find_public_sound_path(name)
-        if not public_path:
-            await ctx.followup.send(f"❌ Public sound `{name}` not found. Use `/publicsounds` to check.", ephemeral=True); return
-
-        public_base_name = os.path.splitext(os.path.basename(public_path))[0]
-
-        # Security check
-        public_dir_abs = os.path.abspath(config.PUBLIC_SOUNDS_DIR)
-        resolved_path_abs = os.path.abspath(public_path)
-        if not resolved_path_abs.startswith(public_dir_abs + os.sep):
-            log.critical(f"CRITICAL SECURITY ALERT: Path traversal attempt in /removepublic. Admin: {admin.id}, Input: '{name}', Resolved Path: '{resolved_path_abs}'")
-            await ctx.followup.send("❌ Internal security error preventing deletion.", ephemeral=True); return
-
-        try:
-            deleted_filename = os.path.basename(public_path)
-            os.remove(public_path)
-            log.info(f"ADMIN ACTION: Deleted public sound file '{deleted_filename}' by {admin.name}.")
-            await ctx.followup.send(f"🗑️ Public sound `{public_base_name}` deleted successfully.", ephemeral=True)
-        except OSError as e:
-            log.error(f"Admin {admin.name} failed to delete public sound '{public_path}': {e}", exc_info=True)
-            await ctx.followup.send(f"❌ Failed to delete public sound `{public_base_name}`: Could not remove file ({type(e).__name__}).", ephemeral=True)
-        except Exception as e:
-            log.error(f"Admin {admin.name} encountered unexpected error deleting public sound '{public_path}': {e}", exc_info=True)
-            await ctx.followup.send(f"❌ An unexpected error occurred while deleting public sound `{public_base_name}`.", ephemeral=True)
-
     # --- Error Handlers for Admin Commands ---
     @togglestay.error
-    @removepublic.error
     async def admin_command_error(self, ctx: discord.ApplicationContext, error: discord.DiscordException):
         """Error handler specifically for admin commands permissions and cooldown."""
         if isinstance(error, commands.MissingPermissions):
