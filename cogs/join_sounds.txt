@@ -1,0 +1,123 @@
+# -*- coding: utf-8 -*-
+import discord
+from discord.ext import commands
+import os
+import logging
+
+from utils import file_helpers # Import helpers
+import data_manager # Import data manager functions
+import config # Import config for paths
+
+log = logging.getLogger('SoundBot.Cogs.JoinSounds')
+
+class JoinSoundsCog(commands.Cog):
+    def __init__(self, bot: discord.Bot):
+        self.bot = bot
+        # Access data stored on the bot instance
+        self.user_sound_config = getattr(bot, 'user_sound_config')
+
+    @discord.slash_command(name="setjoinsound", description="Upload your custom join sound. Replaces existing.")
+    @commands.cooldown(1, 15, commands.BucketType.user)
+    async def setjoinsound(
+        self,
+        ctx: discord.ApplicationContext,
+        sound_file: discord.Option(discord.Attachment, description=f"Sound file ({', '.join(config.ALLOWED_EXTENSIONS)}). Max {config.MAX_USER_SOUND_SIZE_MB}MB.", required=True)
+    ):
+        """Allows a user to upload and set their custom join sound."""
+        await ctx.defer(ephemeral=True)
+        author = ctx.author
+        user_id_str = str(author.id)
+        log.info(f"COMMAND: /setjoinsound by {author.name} ({user_id_str}), filename: '{sound_file.filename}'")
+
+        file_extension = os.path.splitext(sound_file.filename)[1].lower()
+        final_save_filename = f"joinsound_{user_id_str}{file_extension}"
+        final_save_path = os.path.join(config.SOUNDS_DIR, final_save_filename)
+
+        user_config = self.user_sound_config.get(user_id_str, {})
+        old_config_filename = user_config.get("join_sound")
+
+        # Validate and save the uploaded file using the helper
+        success, error_msg = await file_helpers.validate_and_save_upload(ctx, sound_file, final_save_path, command_name="setjoinsound")
+
+        if success:
+            log.info(f"Join sound validation successful for {author.name}, saved to '{final_save_path}'")
+            # Remove old join sound file if it existed and had a different name
+            if old_config_filename and old_config_filename != final_save_filename:
+                old_path = os.path.join(config.SOUNDS_DIR, old_config_filename)
+                if os.path.exists(old_path):
+                    try:
+                        os.remove(old_path)
+                        log.info(f"Removed previous join sound file: '{old_path}' for user {user_id_str}")
+                    except Exception as e:
+                        log.warning(f"Could not remove previous join sound file '{old_path}' for user {user_id_str}: {e}")
+
+            # Update user config
+            user_config["join_sound"] = final_save_filename
+            self.user_sound_config[user_id_str] = user_config
+            data_manager.save_user_config(self.user_sound_config) # Persist changes
+            log.info(f"Updated join sound config for {author.name} to '{final_save_filename}'")
+            await ctx.followup.send(f"✅ Success! Your join sound is set to `{sound_file.filename}`. The bot will now use this instead of TTS.", ephemeral=True)
+        else:
+            await ctx.followup.send(error_msg or "❌ An unknown error occurred during validation.", ephemeral=True)
+
+
+    @discord.slash_command(name="removejoinsound", description="Remove your custom join sound, revert to TTS.")
+    @commands.cooldown(1, 5, commands.BucketType.user)
+    async def removejoinsound(self, ctx: discord.ApplicationContext):
+        """Removes the user's custom join sound configuration and file."""
+        await ctx.defer(ephemeral=True)
+        author = ctx.author
+        user_id_str = str(author.id)
+        log.info(f"COMMAND: /removejoinsound by {author.name} ({user_id_str})")
+
+        user_config = self.user_sound_config.get(user_id_str)
+        if user_config and "join_sound" in user_config:
+            filename_to_remove = user_config.pop("join_sound")
+            log.info(f"Removing join sound config for {author.name} (was '{filename_to_remove}')")
+
+            if not user_config: # If config becomes empty, remove user entry
+                if user_id_str in self.user_sound_config:
+                    del self.user_sound_config[user_id_str]
+                    log.info(f"Removed empty user config entry for {author.name} after join sound removal.")
+            data_manager.save_user_config(self.user_sound_config) # Save the updated config
+
+            # Remove the actual sound file
+            file_path_to_remove = os.path.join(config.SOUNDS_DIR, filename_to_remove)
+            if os.path.exists(file_path_to_remove):
+                try:
+                    os.remove(file_path_to_remove)
+                    log.info(f"Deleted file: '{file_path_to_remove}' (custom join sound for {user_id_str})")
+                except OSError as e:
+                    log.warning(f"Could not delete file '{file_path_to_remove}' during join sound removal: {e}")
+            else:
+                 log.warning(f"Configured join sound '{filename_to_remove}' not found at '{file_path_to_remove}' during removal for user {user_id_str}.")
+
+            # Clean up potentially orphaned temporary join TTS files
+            prefix_to_clean = f"tts_join_{user_id_str}_"
+            cleaned_temp_count = 0
+            try:
+                with os.scandir(config.SOUNDS_DIR) as entries:
+                    for entry in entries:
+                        if entry.is_file() and entry.name.startswith(prefix_to_clean) and entry.name.endswith(".mp3"):
+                            try: os.remove(entry.path); cleaned_temp_count += 1; log.debug(f"Cleaned up old temp join TTS: {entry.name}")
+                            except OSError as e_clean: log.warning(f"Could not clean temp TTS file '{entry.path}': {e_clean}")
+            except OSError as e_list:
+                 log.warning(f"Could not list SOUNDS_DIR for TTS cleanup: {e_list}")
+
+            msg = "🗑️ Custom join sound removed."
+            if cleaned_temp_count > 0: msg += f" Cleaned up {cleaned_temp_count} cached join TTS file(s)."
+            msg += " The bot will now use TTS to announce your name when you join."
+            await ctx.followup.send(msg, ephemeral=True)
+        else:
+            await ctx.followup.send("🤷 You don't have a custom join sound configured. The bot uses TTS for your join message by default.", ephemeral=True)
+
+
+def setup(bot: discord.Bot):
+    # Ensure user_sound_config is available on the bot instance
+    if not hasattr(bot, 'user_sound_config'):
+         log.critical("User config not found on bot instance during JoinSoundsCog setup!")
+         return
+
+    bot.add_cog(JoinSoundsCog(bot))
+    log.info("JoinSounds Cog loaded.")
+
