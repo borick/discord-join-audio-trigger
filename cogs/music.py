@@ -218,7 +218,7 @@ class MusicCog(commands.Cog):
         thumbnail = video_info.get('thumbnail')
         if thumbnail: embed.set_thumbnail(url=thumbnail)
 
-        await self.playback_manager._try_respond(ctx.interaction, content="", embed=embed, ephemeral=False) # Send embed confirming queue add
+        await self.playback_manager._try_respond(ctx.interaction, message="", embed=embed, ephemeral=False) # Send embed confirming queue add
 
         # Note: add_to_queue now calls start_playback_if_idle, so no need to explicitly start here
 
