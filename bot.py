@@ -2823,17 +2823,17 @@ if __name__ == "__main__":
         bot_logger.critical("BOT_TOKEN environment variable not set. Cannot start.")
         exit(1)
 
-    # Opus Loading Check
-    opus_loaded = discord.opus.is_loaded()
-    if not opus_loaded:
-        bot_logger.warning("Default Opus load failed. Ensure libopus is installed and accessible.")
-        # Add explicit loading attempts if needed
-        # ... (platform-specific paths) ...
-        if not discord.opus.is_loaded():
-             bot_logger.critical("CRITICAL: Opus library failed to load. Voice WILL NOT WORK.")
-             # exit(1) # Optional: exit if critical
-    else:
-         bot_logger.info("Opus library loaded successfully.")
+    # # Opus Loading Check
+    # opus_loaded = discord.opus.is_loaded()
+    # if not opus_loaded:
+    #     bot_logger.warning("Default Opus load failed. Ensure libopus is installed and accessible.")
+    #     # Add explicit loading attempts if needed
+    #     # ... (platform-specific paths) ...
+    #     if not discord.opus.is_loaded():
+    #          bot_logger.critical("CRITICAL: Opus library failed to load. Voice WILL NOT WORK.")
+    #          # exit(1) # Optional: exit if critical
+    # else:
+    #      bot_logger.info("Opus library loaded successfully.")
 
     # PyNaCl Check
     try:
