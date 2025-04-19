@@ -13,6 +13,7 @@ import re # For cleaning filenames and potentially other text processing
 from typing import List, Optional, Tuple, Dict, Any, Coroutine # For type hinting
 import shutil # For copying/moving files
 import unicodedata # For advanced character normalization
+import sys, struct
 
 # Import edge-tts
 try:
@@ -2813,37 +2814,79 @@ async def on_application_command_error(ctx: discord.ApplicationContext, error: d
 # --- Run the Bot ---
 if __name__ == "__main__":
     # Final Dependency Checks before running
-    if not PYDUB_AVAILABLE:
-        bot_logger.critical("Pydub library missing or failed to import. Cannot start. Install: pip install pydub ffmpeg")
-        exit(1)
-    if not EDGE_TTS_AVAILABLE:
-        bot_logger.critical("edge-tts library missing or failed to import. Cannot start. Install: pip install edge-tts")
-        exit(1)
-    if not BOT_TOKEN:
-        bot_logger.critical("BOT_TOKEN environment variable not set. Cannot start.")
-        exit(1)
+    if not PYDUB_AVAILABLE: bot_logger.critical("Pydub missing/failed. Install: pip install pydub ffmpeg"); exit(1)
+    if not EDGE_TTS_AVAILABLE: bot_logger.critical("edge-tts missing/failed. Install: pip install edge-tts"); exit(1)
+    if not BOT_TOKEN: bot_logger.critical("BOT_TOKEN environment variable not set."); exit(1)
 
-    # # Opus Loading Check
-    # opus_loaded = discord.opus.is_loaded()
-    # if not opus_loaded:
-    #     bot_logger.warning("Default Opus load failed. Ensure libopus is installed and accessible.")
-    #     # Add explicit loading attempts if needed
-    #     # ... (platform-specific paths) ...
-    #     if not discord.opus.is_loaded():
-    #          bot_logger.critical("CRITICAL: Opus library failed to load. Voice WILL NOT WORK.")
-    #          # exit(1) # Optional: exit if critical
-    # else:
-    #      bot_logger.info("Opus library loaded successfully.")
+    # --- Modified Opus Loading Check ---
+    opus_load_success = False
+    if discord.opus.is_loaded():
+        bot_logger.info("Opus library already loaded.")
+        opus_load_success = True
+    else:
+        bot_logger.info("Opus library not initially loaded. Attempting default load...")
+        try:
+            # Simulate the internal _load_default() logic relevant for Windows
+            if sys.platform == 'win32':
+                basedir = os.path.dirname(os.path.abspath(discord.opus.__file__))
+                _bitness = struct.calcsize('P') * 8
+                _target = 'x64' if _bitness > 32 else 'x86'
+                _filename = os.path.join(basedir, 'bin', f'libopus-0.{_target}.dll')
+                if os.path.exists(_filename):
+                    discord.opus.load_opus(_filename)
+                    opus_load_success = discord.opus.is_loaded()
+                    if opus_load_success:
+                         bot_logger.info(f"Successfully loaded bundled Opus DLL: {_filename}")
+                    else:
+                         bot_logger.warning("Attempted to load bundled Opus DLL, but is_loaded() is still False.")
+                else:
+                    bot_logger.warning(f"Bundled Opus DLL not found at expected path: {_filename}")
+            else:
+                # Attempt find_library for other platforms
+                found_path = ctypes.util.find_library('opus')
+                if found_path:
+                    discord.opus.load_opus(found_path)
+                    opus_load_success = discord.opus.is_loaded()
+                    if opus_load_success:
+                         bot_logger.info(f"Successfully loaded Opus via find_library: {found_path}")
+                    else:
+                         bot_logger.warning("Found Opus via find_library, but is_loaded() is still False after load attempt.")
+                else:
+                     bot_logger.warning("Could not find Opus library using ctypes.util.find_library('opus').")
 
-    # PyNaCl Check
-    try:
-        import nacl
-        bot_logger.info("PyNaCl library found.")
-    except ImportError:
-        bot_logger.critical("CRITICAL: PyNaCl library not found. Voice WILL NOT WORK. Install: pip install PyNaCl")
-        exit(1)
+            # Final check if any method worked
+            if not opus_load_success:
+                 # Try loading just 'opus' as a last resort (might work if in PATH)
+                 try:
+                     discord.opus.load_opus('opus')
+                     opus_load_success = discord.opus.is_loaded()
+                     if opus_load_success:
+                          bot_logger.info("Successfully loaded Opus using generic name 'opus'.")
+                 except OSError:
+                     bot_logger.warning("Failed to load Opus using generic name 'opus'.")
 
-    # Start the bot
+        except Exception as e:
+            bot_logger.error(f"Error occurred during explicit Opus load attempt: {e}", exc_info=True)
+
+    # Report final status
+    if opus_load_success:
+        try:
+            version = discord.opus._OpusStruct.get_opus_version()
+            bot_logger.info(f"Opus library loading confirmed. Version: {version}")
+        except Exception as e:
+            bot_logger.warning(f"Opus loaded, but failed to get version string: {e}")
+    else:
+        # Downgraded from CRITICAL since you don't want it to exit
+        bot_logger.error("❌ FAILED to confirm Opus library loading during startup checks.")
+        bot_logger.error("   While playback might seem to work sometimes, this indicates a non-standard setup.")
+        bot_logger.error("   Voice stability issues or future failures are possible. Check library paths/permissions.")
+        # NO exit(1) here anymore
+
+    # PyNaCl Check (Still crucial for Voice)
+    try: import nacl; bot_logger.info("PyNaCl library found.")
+    except ImportError: bot_logger.critical("CRITICAL: PyNaCl library not found. Voice WILL NOT WORK. Install: pip install PyNaCl"); exit(1)
+
+    # Add top-level error handling for bot.run()
     try:
         bot_logger.info("Attempting bot startup...")
         bot.run(BOT_TOKEN)
@@ -2851,8 +2894,10 @@ if __name__ == "__main__":
         bot_logger.critical("CRITICAL STARTUP ERROR: Login Failure - Invalid BOT_TOKEN.")
         exit(1)
     except discord.errors.PrivilegedIntentsRequired as e:
-        bot_logger.critical(f"CRITICAL STARTUP ERROR: Missing Privileged Intents: {e}. Enable required intents in Dev Portal.")
+        bot_logger.critical(f"CRITICAL STARTUP ERROR: Missing Privileged Intents: {e}. Enable in Dev Portal.")
         exit(1)
     except Exception as e:
         bot_logger.critical(f"FATAL RUNTIME ERROR: {e}", exc_info=True)
         exit(1)
+    finally:
+        bot_logger.info("Bot process has ended.")
