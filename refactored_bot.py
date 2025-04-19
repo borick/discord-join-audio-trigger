@@ -141,7 +141,7 @@ log.info("PlaybackManager initialized.")
 log.info("Loading Cogs...")
 # Define the order if necessary, otherwise load alphabetically
 cog_files = [
-    'events', 'admin', 'join_sounds', 'user_sounds', 'public_sounds', 'tts'
+    'events', 'admin', 'join_sounds', 'user_sounds', 'public_sounds', 'tts', 'music'
 ]
 # Construct cog paths relative to this file's directory
 cogs_dir = os.path.join(os.path.dirname(__file__), 'cogs')

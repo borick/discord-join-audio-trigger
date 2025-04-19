@@ -156,7 +156,16 @@ class EventsCog(commands.Cog):
                      return # Don't proceed if permissions are missing
 
                  # Add to the playback manager's queue
-                 await self.playback_manager.add_to_queue(guild_id, member, sound_path)
+                 # await self.playback_manager.add_to_queue(guild_id, member, sound_path)
+                 join_queue_item = {
+                  'type': 'join',            # Identify the type of queue item
+                  'member': member,          # Pass the discord.Member object
+                  'path': sound_path,        # Pass the path to the sound file
+                  'is_temp_tts': is_temp_sound, # Pass the boolean flag
+                  'guild_id': guild_id       # Including guild_id here can be helpful for logging/cleanup later
+                 }
+                 # Now call add_to_queue with the guild_id and the single item dictionary
+                 await self.playback_manager.add_to_queue(guild_id, join_queue_item)
 
                  # Ensure the bot is connected and the playback task is running
                  try:
@@ -193,10 +202,10 @@ class EventsCog(commands.Cog):
                          # Check if a task is already running/scheduled for this guild
                          if guild_id not in self.playback_manager.guild_play_tasks or self.playback_manager.guild_play_tasks[guild_id].done():
                              task_name = f"QueueStart_Event_{guild_id}"
-                             if self.playback_manager.guild_sound_queues.get(guild_id): # Check queue has items
+                             if self.playback_manager.guild_queues.get(guild_id): # Check queue has items
                                  log.info(f"Event: Starting new play task '{task_name}'.")
                                  self.playback_manager.guild_play_tasks[guild_id] = asyncio.create_task(
-                                     self.playback_manager.play_next_in_queue(guild),
+                                     self.playback_manager.play_next_item(guild),
                                      name=task_name
                                  )
                              else:
@@ -214,12 +223,14 @@ class EventsCog(commands.Cog):
 
                  except asyncio.TimeoutError:
                       log.error(f"VOICE (Event): Timeout connecting/moving to '{channel_to_join.name}'.")
-                      if guild_id in self.playback_manager.guild_sound_queues: self.playback_manager.guild_sound_queues[guild_id].clear()
+                      if guild_id in self.playback_manager.guild_queues: self.playback_manager.guild_queues[guild_id].clear()
                  except discord.errors.ClientException as e:
                       log.warning(f"VOICE (Event): ClientException during connect/move: {e}")
                  except Exception as e:
                       log.error(f"VOICE (Event): Unexpected error during connect/move: {e}", exc_info=True)
-                      if guild_id in self.playback_manager.guild_sound_queues: self.playback_manager.guild_sound_queues[guild_id].clear()
+                      if guild_id in self.playback_manager.guild_queues:
+                          self.playback_manager.guild_queues[guild_id].clear()
+                          
 
             else:
                  # sound_path is None (means custom sound missing and TTS failed/disabled)
@@ -250,8 +261,8 @@ class EventsCog(commands.Cog):
                     if play_task and not play_task.done():
                         play_task.cancel()
                         log.debug(f"Cleaned up play task for disconnected guild {guild_id} via event.")
-                if guild_id in self.playback_manager.guild_sound_queues:
-                    self.playback_manager.guild_sound_queues[guild_id].clear()
+                if guild_id in self.playback_manager.guild_queues:
+                    self.playback_manager.guild_queues[guild_id].clear()
                     log.debug(f"Cleared sound queue for disconnected guild {guild_id} via event.")
 
             # Case 2: Bot Moved
