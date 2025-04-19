@@ -310,18 +310,13 @@ class TTSCog(commands.Cog):
         spell_note = " (spelled out)" if spell_out else ""
         playback_display_name = f"TTS{spell_note} w/ {voice_display_name}: \"{display_msg_truncated}\""
 
-        # === THIS IS THE CORRECTED LINE ===
-        await self.playback_manager.play_single_sound(
+        await self.playback_manager.play_audio_source_now(  # <--- MUST BE play_audio_source_now
             interaction=ctx.interaction,
             audio_source=audio_source,
-            audio_buffer_to_close=pcm_fp, # Pass the buffer here!
-            display_name=playback_display_name # Pass the text for user feedback
+            audio_buffer_to_close=pcm_fp, # Pass the buffer to be closed
+            display_name=playback_display_name
         )
-        # ==================================
-
-        # The play_single_sound method will handle sending the "Playing..." message
-        # and the after_play_cleanup in playback_manager will close the pcm_fp buffer.
-
+        log.info(f"TTS: Playback started for {user.name} in {target_channel.name} ({target_channel.id}).")
 
 def setup(bot: commands.Bot):
     if not TTS_READY:

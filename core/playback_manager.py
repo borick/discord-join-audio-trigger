@@ -1,591 +1,927 @@
 # core/playback_manager.py
-# -*- coding: utf-8 -*-
+
 import discord
-from discord.ext import commands
 import asyncio
-import os
-import io
-import math
 import logging
-from collections import deque
-from typing import Dict, Any, Optional, Tuple, List, Union
-import datetime
-import shutil
+import io
+import os
+from collections import defaultdict
+from typing import Dict, List, Optional, Union, Any # <--- Make sure 'Any' is imported
+import time
+import functools
+from discord.ext import commands
+from enum import Enum, auto
 
-# Check required libraries
-try:
-    from pydub import AudioSegment
-    from pydub.exceptions import CouldntDecodeError
-    PYDUB_AVAILABLE = True
-except ImportError:
-    PYDUB_AVAILABLE = False
-
+# Local application imports
 import config
+from utils import audio_processor
+
+# --- Define QueueItemType ---
+QueueItemType = Any # Define the type alias here
+# -----------------------------
 
 log = logging.getLogger('SoundBot.PlaybackManager')
 
-# --- Type Hints ---
-MusicQueueItem = Dict[str, Any]
-JoinQueueItem = Dict[str, Any]
-TTSQueueItem = Dict[str, Any]
-QueueItem = Union[MusicQueueItem, JoinQueueItem, TTSQueueItem]
+# --- Added PlaybackMode Enum ---
+class PlaybackMode(Enum):
+    IDLE = auto()
+    QUEUE = auto()
+    SINGLE_SOUND = auto()
+# -----------------------------
 
+IDLE_TIMEOUT_SECONDS = getattr(config, 'MUSIC_IDLE_TIMEOUT', 300)
 
 class PlaybackManager:
-    """Handles unified audio queue, playback, VC connection/state management."""
-
+    """Manages voice connections, queues, and playback state for guilds."""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.config = bot.config
-        self.guild_queues: Dict[int, deque[QueueItem]] = {}
-        self.guild_play_tasks: Dict[int, asyncio.Task[Any]] = {}
-        self.guild_leave_timers: Dict[int, asyncio.Task[Any]] = {}
-        self.currently_playing: Dict[int, Optional[QueueItem]] = {}
+        self.guild_queues: Dict[int, List[QueueItemType]] = defaultdict(list)
+        self.currently_playing: Dict[int, Optional[QueueItemType]] = defaultdict(lambda: None)
+        self.guild_locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self.idle_timers: Dict[int, asyncio.Task] = {}
+        self.playback_mode: Dict[int, PlaybackMode] = defaultdict(lambda: PlaybackMode.IDLE)
+        # Buffer storage specifically for sounds played via play_single_sound
+        self.active_single_buffers: Dict[int, io.BytesIO] = {}
 
-    def process_audio(self, sound_path: str, display_name: str = "Audio", *, apply_duration_limit: bool = True) -> Tuple[Optional[discord.PCMAudio], Optional[io.BytesIO]]:
-        """ Loads, TRIMS, normalizes, and prepares audio for Discord playback. """
-        if not PYDUB_AVAILABLE: log.error("AUDIO: Pydub unavailable."); return None, None
-        if not os.path.exists(sound_path): log.error(f"AUDIO: File not found: {sound_path}"); return None, None
+    async def ensure_voice_client(
+        self,
+        interaction: Optional[discord.Interaction],
+        target_channel: discord.VoiceChannel,
+        action_type: str = "ACTION"
+    ) -> Optional[discord.VoiceClient]:
+        """
+        Ensures the bot is connected to the target voice channel.
+        Connects if not connected, moves if necessary and possible.
+        Returns the VoiceClient on success, None on failure.
+        Sends feedback via interaction if provided.
+        """
+        guild = target_channel.guild
+        current_vc = discord.utils.get(self.bot.voice_clients, guild=guild)
+        guild_id = guild.id # Added for logging consistency
 
-        audio_source: Optional[discord.PCMAudio] = None
-        pcm_data_io: Optional[io.BytesIO] = None
-        basename = os.path.basename(sound_path)
-        try:
-            log.debug(f"AUDIO: Loading '{basename}' (Display Hint: {display_name})...")
-            ext = os.path.splitext(sound_path)[1].lower().strip('.')
-            format_hint = ext if ext else 'mp3'
-            try: audio_segment = AudioSegment.from_file(sound_path, format=format_hint)
-            except CouldntDecodeError: log.warning(f"AUDIO: Decode failed with format '{format_hint}', retrying auto."); audio_segment = AudioSegment.from_file(sound_path)
-            except Exception as load_e: log.error(f"AUDIO: Load failed: {load_e}", exc_info=True); raise load_e
-            log.debug(f"AUDIO: Loaded '{basename}' ({len(audio_segment)}ms)")
-            # Trimming
-            if apply_duration_limit: # Check the new parameter
-                if len(audio_segment) > self.config.MAX_PLAYBACK_DURATION_MS:
-                    log.info(f"AUDIO (Limit Enabled): Trimming '{basename}' to {self.config.MAX_PLAYBACK_DURATION_MS}ms.")
-                    audio_segment = audio_segment[:self.config.MAX_PLAYBACK_DURATION_MS]
-                else:
-                    log.debug(f"AUDIO (Limit Enabled): Duration within limit for '{basename}'.")
+        if current_vc:
+            if current_vc.channel == target_channel:
+                log.debug(f"Already connected to {target_channel.name} in GID:{guild_id}")
+                return current_vc
             else:
-                log.info(f"AUDIO (Limit Disabled): Skipping duration trim for '{basename}' ({len(audio_segment)}ms).")
-            # Normalization
-            apply_normalization = True
-            if apply_normalization:
-                peak_dbfs = audio_segment.max_dBFS
-                if not math.isinf(peak_dbfs) and peak_dbfs > -90.0:
-                    target_dbfs = self.config.TARGET_LOUDNESS_DBFS; change_in_dbfs = target_dbfs - peak_dbfs
-                    gain_limit = 6.0; apply_gain = min(change_in_dbfs, gain_limit) if change_in_dbfs > 0 else change_in_dbfs
-                    if apply_gain != change_in_dbfs: log.info(f"AUDIO: Gain limited to +{gain_limit}dB.")
-                    log.info(f"AUDIO: Normalizing '{basename}'. Peak:{peak_dbfs:.2f} Target:{target_dbfs:.2f} ApplyGain:{apply_gain:.2f} dB.")
-                    audio_segment = audio_segment.apply_gain(apply_gain)
-                elif math.isinf(peak_dbfs): log.warning(f"AUDIO: Cannot normalize silent audio '{basename}'.")
-                else: log.warning(f"AUDIO: Skipping normalization for quiet audio '{basename}'. Peak: {peak_dbfs:.2f}")
-            else: log.debug(f"AUDIO: Normalization skipped.")
-            # Format Conversion
-            log.debug(f"AUDIO: Converting '{basename}' to PCM S16LE (48kHz, Stereo)...")
-            audio_segment = audio_segment.set_frame_rate(48000).set_channels(2)
-            pcm_data_io = io.BytesIO(); audio_segment.export(pcm_data_io, format="s16le"); pcm_data_io.seek(0)
-            if pcm_data_io.getbuffer().nbytes > 0: audio_source = discord.PCMAudio(pcm_data_io); log.debug(f"AUDIO: Processed '{basename}' ({pcm_data_io.getbuffer().nbytes} bytes)."); return audio_source, pcm_data_io
-            else: log.error(f"AUDIO: Exported PCM empty!"); pcm_data_io.close(); return None, None
-        except CouldntDecodeError as decode_err: log.error(f"AUDIO: Pydub Decode Error: {decode_err}", exc_info=True)
-        except FileNotFoundError: log.error(f"AUDIO: File not found processing: '{sound_path}'")
-        except Exception as e: log.error(f"AUDIO: Unexpected processing error: {e}", exc_info=True)
-        finally: # Ensure buffer closed if processing failed
-            if audio_source is None and pcm_data_io and not pcm_data_io.closed:
-                try: pcm_data_io.close()
+                my_perms = target_channel.permissions_for(guild.me)
+                if not my_perms.connect or not my_perms.speak:
+                    log.warning(f"Missing permissions to move/speak in {target_channel.name} (GID:{guild_id})")
+                    if interaction: await self._try_respond(interaction, f"❌ I don't have permissions to join or speak in {target_channel.mention}.", ephemeral=True)
+                    return None
+                try:
+                    log.info(f"Moving from {current_vc.channel.name} to {target_channel.name} (GID:{guild_id}) for {action_type}")
+                    await current_vc.move_to(target_channel)
+                    return current_vc
+                except asyncio.TimeoutError:
+                    log.error(f"Timeout moving to {target_channel.name} (GID:{guild_id})")
+                    if interaction: await self._try_respond(interaction, "❌ Timed out trying to move voice channels.", ephemeral=True)
+                    return None
+                except Exception as e:
+                    log.error(f"Error moving to {target_channel.name} (GID:{guild_id}): {e}", exc_info=True)
+                    if interaction: await self._try_respond(interaction, "❌ An error occurred while moving voice channels.", ephemeral=True)
+                    return None
+        else:
+            my_perms = target_channel.permissions_for(guild.me)
+            if not my_perms.connect or not my_perms.speak:
+                log.warning(f"Missing permissions to connect/speak in {target_channel.name} (GID:{guild_id})")
+                if interaction: await self._try_respond(interaction, f"❌ I don't have permissions to join or speak in {target_channel.mention}.", ephemeral=True)
+                return None
+            try:
+                log.info(f"Connecting to {target_channel.name} (GID:{guild_id}) for {action_type}")
+                vc = await target_channel.connect()
+                return vc
+            except asyncio.TimeoutError:
+                log.error(f"Timeout connecting to {target_channel.name} (GID:{guild_id})")
+                if interaction: await self._try_respond(interaction, "❌ Timed out trying to connect to the voice channel.", ephemeral=True)
+                return None
+            except discord.ClientException as e:
+                # Handle cases where the bot might already be connecting
+                log.error(f"Discord ClientException connecting to {target_channel.name} (GID:{guild_id}): {e}")
+                if "already connected" in str(e).lower():
+                     if interaction: await self._try_respond(interaction, "⏳ Already connecting/connected to a voice channel. Please wait.", ephemeral=True)
+                elif "already connecting" in str(e).lower(): # Discord.py can sometimes use this phrase too
+                     if interaction: await self._try_respond(interaction, "⏳ Already connecting to the voice channel. Please wait.", ephemeral=True)
+                else:
+                     if interaction: await self._try_respond(interaction, f"❌ Error connecting: {e}", ephemeral=True)
+                return None
+            except Exception as e:
+                log.error(f"Unexpected error connecting to {target_channel.name} (GID:{guild_id}): {e}", exc_info=True)
+                if interaction: await self._try_respond(interaction, "❌ An unexpected error occurred while connecting.", ephemeral=True)
+                return None
+
+    async def safe_disconnect(self, vc: discord.VoiceClient, manual_leave: bool = False, reason: str = "Unknown"):
+        """Stops playback, clears state, cancels timers and disconnects."""
+        if not vc or not vc.guild:
+            log.warning("safe_disconnect called with invalid VC")
+            return
+
+        guild_id = vc.guild.id
+        log.info(f"Initiating safe disconnect for GID:{guild_id}. Reason: {reason}")
+
+        # Cancel the main bot leave timer (handled by voice_helpers)
+        # Import voice_helpers if needed at the top
+        # from utils import voice_helpers
+        # voice_helpers.cancel_leave_timer(self.bot, guild_id, reason=f"safe_disconnect ({reason})")
+
+        async with self.guild_locks[guild_id]:
+            if vc.is_playing():
+                log.debug(f"Stopping active player for GID:{guild_id} during disconnect.")
+                vc.stop()
+
+            # Clear specific playback manager state
+            self.currently_playing.pop(guild_id, None)
+            self.guild_queues.pop(guild_id, None)
+            self.playback_mode[guild_id] = PlaybackMode.IDLE
+            self._cancel_idle_timer(guild_id) # Cancel music-specific idle timer
+
+            # Clean up any lingering single-play buffers
+            buffer = self.active_single_buffers.pop(guild_id, None)
+            if buffer and not buffer.closed:
+                try: buffer.close()
                 except Exception: pass
-        return None, None
+                log.debug(f"Closed lingering single-play buffer during disconnect for GID:{guild_id}")
 
 
-    # --- Unified Queue Logic ---
-    async def add_to_queue(self, guild_id: int, item: QueueItem):
-        """Adds an item to the guild's queue and ensures playback starts if idle."""
-        if guild_id not in self.guild_queues: self.guild_queues[guild_id] = deque()
-        self.guild_queues[guild_id].append(item)
-        item_type = item.get('type', 'unknown'); item_name = item.get('title', os.path.basename(item.get('path', 'N/A')))
-        log.info(f"QUEUE GID:{guild_id}: Added '{item_type}' ('{item_name}'). Queue size: {len(self.guild_queues[guild_id])}")
+            log.debug(f"Cleared playback state for GID:{guild_id}")
+
+            try:
+                # Check connection again *inside* lock before disconnect
+                current_vc = discord.utils.get(self.bot.voice_clients, guild__id=guild_id)
+                if current_vc and current_vc.is_connected():
+                    await current_vc.disconnect(force=False)
+                    log.info(f"Successfully disconnected from voice in GID:{guild_id}.")
+                else:
+                    log.info(f"Already disconnected before final disconnect call in GID:{guild_id}")
+
+            except Exception as e:
+                log.error(f"Error during voice client disconnect for GID:{guild_id}: {e}", exc_info=True)
+
+
+    def get_queue(self, guild_id: int) -> List[QueueItemType]:
+        """Returns the queue for a given guild."""
+        return self.guild_queues.get(guild_id, [])
+
+    def get_current_item(self, guild_id: int) -> Optional[QueueItemType]:
+        """Returns the currently playing item for a given guild."""
+        return self.currently_playing.get(guild_id)
+
+    async def add_to_queue(self, guild_id: int, item: QueueItemType) -> int:
+        """Adds an item to the end of the guild's queue. Returns new queue position."""
+        async with self.guild_locks[guild_id]:
+            queue = self.guild_queues[guild_id]
+            queue.append(item)
+            position = len(queue)
+            log.debug(f"Added item to queue for GID {guild_id}. New length: {position}. Item Type: {type(item).__name__}")
+
+            # Automatically trigger playback check if conditions are met
+            vc = discord.utils.get(self.bot.voice_clients, guild__id=guild_id)
+            if vc and vc.is_connected() and not self.is_playing(guild_id) and position == 1:
+                 # Check if the current mode allows queue playback
+                 if self.playback_mode[guild_id] in [PlaybackMode.IDLE, PlaybackMode.QUEUE]:
+                    log.info(f"Queue was empty/idle, new item added. Triggering playback check for GID {guild_id}.")
+                    # Ensure the mode is set correctly before starting
+                    self.playback_mode[guild_id] = PlaybackMode.QUEUE
+                    self.bot.loop.create_task(self._play_next(guild_id, vc))
+                 else:
+                    log.debug(f"Item added to queue for GID {guild_id}, but mode is {self.playback_mode[guild_id]}, not starting playback automatically.")
+
+            return position
+
+
+    async def insert_into_queue(self, guild_id: int, index: int, item: QueueItemType):
+        """Inserts an item at a specific index in the guild's queue."""
+        async with self.guild_locks[guild_id]:
+            queue = self.guild_queues[guild_id]
+            # Clamp index to valid range
+            index = max(0, min(index, len(queue)))
+            queue.insert(index, item)
+            log.debug(f"Inserted item at index {index} for GID {guild_id}. New length: {len(queue)}")
+
+            # Trigger playback check if inserted at front and idle
+            vc = discord.utils.get(self.bot.voice_clients, guild__id=guild_id)
+            if index == 0 and vc and vc.is_connected() and not self.is_playing(guild_id):
+                if self.playback_mode[guild_id] in [PlaybackMode.IDLE, PlaybackMode.QUEUE]:
+                    log.info(f"Item inserted at front of idle queue. Triggering playback check for GID {guild_id}.")
+                    self.playback_mode[guild_id] = PlaybackMode.QUEUE
+                    self.bot.loop.create_task(self._play_next(guild_id, vc))
+                else:
+                     log.debug(f"Item inserted at front for GID {guild_id}, but mode is {self.playback_mode[guild_id]}, not starting playback automatically.")
+
+
+    async def remove_from_queue(self, guild_id: int, index: int) -> Optional[QueueItemType]:
+        """Removes an item from the queue by index. Returns the removed item or None."""
+        async with self.guild_locks[guild_id]:
+            queue = self.guild_queues.get(guild_id)
+            if queue and 0 <= index < len(queue):
+                removed_item = queue.pop(index)
+                log.debug(f"Removed item at index {index} for GID {guild_id}.")
+                # Add cleanup logic here if removed item needs it (e.g., delete temp file)
+                # Consider adding type checks if queue can hold different types
+                return removed_item
+            else:
+                log.warning(f"Attempted to remove item at invalid index {index} for GID {guild_id}. Queue length: {len(queue) if queue else 0}")
+                return None
+
+    async def clear_queue(self, guild_id: int):
+        """Clears the queue for a specific guild."""
+        async with self.guild_locks[guild_id]:
+            if guild_id in self.guild_queues:
+                count = len(self.guild_queues[guild_id])
+                # Add cleanup for each item if needed before clearing
+                # for item in self.guild_queues[guild_id]: ...
+                self.guild_queues.pop(guild_id, None)
+                log.info(f"Cleared queue ({count} items) for GID {guild_id}")
+            else:
+                log.debug(f"Queue already empty or non-existent for GID {guild_id}, clear request ignored.")
+
+    def is_playing(self, guild_id: int) -> bool:
+        """Checks if the bot is currently actively playing audio in a guild."""
         vc = discord.utils.get(self.bot.voice_clients, guild__id=guild_id)
-        if vc and vc.is_connected() and not vc.is_playing(): await self.start_playback_if_idle(vc.guild)
+        # Check VC playing status AND if we have a currently_playing item tracked
+        return bool(vc and vc.is_playing() and guild_id in self.currently_playing and self.currently_playing[guild_id] is not None)
 
-    async def start_playback_if_idle(self, guild: discord.Guild):
-        """Starts the play_next_item task if the bot is idle and queue has items."""
-        guild_id = guild.id
-        vc = discord.utils.get(self.bot.voice_clients, guild=guild)
-        if vc and vc.is_connected() and not vc.is_playing():
-            queue_has_items = guild_id in self.guild_queues and self.guild_queues[guild_id]
-            task_is_running = guild_id in self.guild_play_tasks and not self.guild_play_tasks[guild_id].done()
-            if queue_has_items and not task_is_running:
-                log.info(f"PLAYBACK GID:{guild_id}: Bot idle, queue has items, no active task. Starting task.")
-                task_name = f"PlayTask_{guild_id}"; new_task = self.bot.loop.create_task(self.play_next_item(guild), name=task_name); self.guild_play_tasks[guild_id] = new_task
-            elif not queue_has_items: log.debug(f"PLAYBACK GID:{guild_id}: Idle, queue empty. Checking leave timer."); self.bot.loop.create_task(self.start_leave_timer(vc))
-            else: log.debug(f"PLAYBACK GID:{guild_id}: Idle, queue has items, but task already exists/running.")
-        elif vc and vc.is_playing(): log.debug(f"PLAYBACK GID:{guild_id}: Start check called, bot playing.")
+    async def start_playback_if_idle(self, guild_id: int):
+        """Checks if playback should start (connected, not playing, queue has items) and initiates it."""
+        vc = discord.utils.get(self.bot.voice_clients, guild__id=guild_id)
+        # Acquire lock to prevent race conditions with adding/removing items
+        async with self.guild_locks[guild_id]:
+            # Check conditions *inside* the lock
+            if vc and vc.is_connected() and not self.is_playing(guild_id) and self.guild_queues.get(guild_id):
+                # Ensure playback mode allows starting queue playback
+                if self.playback_mode[guild_id] in [PlaybackMode.IDLE, PlaybackMode.QUEUE]:
+                    log.info(f"Playback idle for GID {guild_id}, queue not empty. Starting playback loop.")
+                    self.playback_mode[guild_id] = PlaybackMode.QUEUE # Set mode explicitly
+                    self.bot.loop.create_task(self._play_next(guild_id, vc))
+                else:
+                    log.debug(f"Start playback check for GID {guild_id}: Mode is {self.playback_mode[guild_id]}, not starting.")
+            elif vc and vc.is_connected() and not self.is_playing(guild_id) and not self.guild_queues.get(guild_id):
+                log.debug(f"Start playback check for GID {guild_id}: Queue is empty, ensuring idle timer starts.")
+                self._start_idle_timer(guild_id, vc)
 
-    async def play_next_item(self, guild: discord.Guild):
-        """Plays the next available item from the unified queue."""
-        guild_id = guild.id; task_id_obj = asyncio.current_task(); task_id = task_id_obj.get_name() if task_id_obj else f'Task_GID_{guild_id}'; log_prefix = f"PLAY NEXT [{task_id} GID:{guild_id}]"
+    async def skip_track(self, guild_id: int) -> bool:
+        """Stops the current track, letting the 'after' callback handle the next."""
+        vc = discord.utils.get(self.bot.voice_clients, guild__id=guild_id)
+        # Use lock to ensure state consistency during skip
+        async with self.guild_locks[guild_id]:
+            if self.is_playing(guild_id) and vc:
+                log.info(f"Skipping track for GID {guild_id}")
+                # vc.stop() triggers the 'after' callback, which will call _play_next
+                vc.stop()
+                # Note: currently_playing is cleared within _play_next or the callback chain
+                return True
+            else:
+                log.warning(f"Skip requested for GID {guild_id}, but nothing is playing.")
+                return False
 
-        # --- Pre-checks ---
-        if task_id_obj and task_id_obj.cancelled():
-            log.debug(f"{log_prefix}: Task cancelled.")
-            if guild_id in self.guild_play_tasks and self.guild_play_tasks.get(guild_id) is task_id_obj: del self.guild_play_tasks[guild_id]
-            self.currently_playing.pop(guild_id, None); return
-        vc = discord.utils.get(self.bot.voice_clients, guild=guild)
-        if not vc or not vc.is_connected():
-            log.warning(f"{log_prefix}: Not connected.");
-            if guild_id in self.guild_queues: self.guild_queues[guild_id].clear()
-            if guild_id in self.guild_play_tasks and self.guild_play_tasks.get(guild_id) is task_id_obj: del self.guild_play_tasks[guild_id]
-            self.currently_playing.pop(guild_id, None); self.cancel_leave_timer(guild_id, reason="bot disconnected"); return
-        if vc.is_playing(): log.debug(f"{log_prefix}: Already playing."); return
-        if guild_id not in self.guild_queues or not self.guild_queues[guild_id]:
-            log.debug(f"{log_prefix}: Queue empty.");
-            if guild_id in self.guild_play_tasks and self.guild_play_tasks.get(guild_id) is task_id_obj: del self.guild_play_tasks[guild_id]
-            self.currently_playing.pop(guild_id, None); self.bot.loop.create_task(self.start_leave_timer(vc)); return
+    async def stop_playback(self, guild_id: int, clear_queue: bool = True, leave_channel: bool = True):
+        """Stops playback completely, optionally clears queue and leaves channel."""
+        log.info(f"Received stop command for GID {guild_id}. Clear: {clear_queue}, Leave: {leave_channel}")
+        vc = discord.utils.get(self.bot.voice_clients, guild__id=guild_id)
 
-        # --- Dequeue Item ---
-        item: Optional[QueueItem] = None
+        async with self.guild_locks[guild_id]:
+            # Set mode to IDLE immediately to prevent further automatic playback starts
+            self.playback_mode[guild_id] = PlaybackMode.IDLE
+            self._cancel_idle_timer(guild_id) # Cancel music idle timer
+
+            if vc and vc.is_playing():
+                log.debug(f"Stopping player for GID {guild_id} due to stop command.")
+                vc.stop() # This will trigger the 'after' callback, but the IDLE mode should prevent restart
+
+            # Clear playback state immediately
+            self.currently_playing.pop(guild_id, None)
+
+            if clear_queue:
+                if guild_id in self.guild_queues:
+                    count = len(self.guild_queues[guild_id])
+                    # TODO: Add cleanup for items being cleared if necessary
+                    self.guild_queues.pop(guild_id, None)
+                    log.info(f"Cleared queue ({count} items) for GID {guild_id} due to stop command.")
+
+            # Clean up any single-play buffers that might be lingering (less likely here, but safe)
+            buffer = self.active_single_buffers.pop(guild_id, None)
+            if buffer and not buffer.closed:
+                try: buffer.close()
+                except Exception: pass
+                log.debug(f"Closed lingering single-play buffer during stop command for GID:{guild_id}")
+
+            if leave_channel and vc and vc.is_connected():
+                 # Call safe_disconnect for proper handling, including general leave timer cancellation
+                 # Use create_task to avoid blocking the lock if disconnect is slow
+                 self.bot.loop.create_task(self.safe_disconnect(vc, manual_leave=True, reason="stop_playback command"))
+            elif vc and vc.is_connected():
+                # If not leaving, but queue is clear and not playing, start the idle timer
+                if not self.guild_queues.get(guild_id) and not vc.is_playing():
+                    self._start_idle_timer(guild_id, vc)
+
+
+    async def _play_next(self, guild_id: int, vc: discord.VoiceClient):
+        """The core loop that plays the next available song in the queue."""
+        log.debug(f"Entered _play_next for GID {guild_id}")
+        lock_acquired = False
         try:
-            item = self.guild_queues[guild_id].popleft(); self.currently_playing[guild_id] = item
-            item_type = item.get('type', 'unknown'); sound_path = item.get('path'); item_name = item.get('title', os.path.basename(sound_path or 'N/A'))
-            log.info(f"{log_prefix}: Dequeued '{item_type}' ('{item_name}'). Queue Left: {len(self.guild_queues[guild_id])}")
-        # *** FIX: Corrected except IndexError block ***
-        except IndexError:
-            log.debug(f"{log_prefix}: Queue empty on pop.")
-            # Clean up task tracker if this task is the one responsible
-            if guild_id in self.guild_play_tasks and self.guild_play_tasks.get(guild_id) is task_id_obj:
-                del self.guild_play_tasks[guild_id]
-            self.currently_playing.pop(guild_id, None)
-            # Check if we should leave
-            self.bot.loop.create_task(self.start_leave_timer(vc))
-            return # Stop this task instance
-        # *** END FIX ***
-        except Exception as e_dequeue:
-            log.error(f"{log_prefix}: Dequeue error: {e_dequeue}", exc_info=True)
-            self.currently_playing.pop(guild_id, None)
-            if guild_id in self.guild_play_tasks and self.guild_play_tasks.get(guild_id) is task_id_obj: del self.guild_play_tasks[guild_id]
-            self.bot.loop.create_task(self.start_leave_timer(vc)); return
+            # Use a shorter timeout for the lock acquisition in the play loop
+            await asyncio.wait_for(self.guild_locks[guild_id].acquire(), timeout=5.0)
+            lock_acquired = True
+            log.debug(f"Acquired lock for GID {guild_id} in _play_next")
 
-        # Validate Item Path
-        sound_path = item.get('path') if item else None
-        if not sound_path or not os.path.exists(sound_path): log.error(f"{log_prefix}: Invalid/missing path: {sound_path}"); self._cleanup_played_item_file(item); self.currently_playing.pop(guild_id, None); self.bot.loop.create_task(self.play_next_item(guild)); return
+            # --- Critical Check: Ensure correct PlaybackMode ---
+            # If mode changed while waiting for lock, abort queue playback
+            if self.playback_mode[guild_id] != PlaybackMode.QUEUE:
+                 log.info(f"Playback mode changed to {self.playback_mode[guild_id]} during _play_next for GID {guild_id}. Aborting queue playback.")
+                 # If now idle, start idle timer
+                 if self.playback_mode[guild_id] == PlaybackMode.IDLE and vc.is_connected() and not vc.is_playing():
+                      self._start_idle_timer(guild_id, vc)
+                 return # Exit the function, do not proceed with queue
+            # -----------------------------------------------------
 
-        # Process Audio
-        display_name = "Audio"; item_type = item.get('type');
-        if item_type == 'join': display_name = f"Join sound for {item.get('member').display_name}"
-        elif item_type == 'music': display_name = item.get('title', 'Music Track')
-        elif item_type == 'tts': display_name = item.get('text_preview', 'TTS Message')
-        should_limit = (item_type != 'music') # Limit unless it's music
-        log.debug(f"{log_prefix}: Processing audio for '{item_name}'. Apply duration limit: {should_limit}")
-        audio_source, audio_buffer_to_close = self.process_audio(
-            sound_path,
-            display_name,
-            apply_duration_limit=should_limit # Pass the flag here
+
+            # Clean up the item that just finished (if any)
+            last_item = self.currently_playing.pop(guild_id, None)
+            if last_item:
+                log.debug(f"Cleaned up previously playing item tracker for GID: {guild_id}. Type: {type(last_item).__name__}")
+                # Update last played timestamp for music items if applicable
+                if hasattr(last_item, 'last_played_at'):
+                    last_item.last_played_at = time.time()
+                # Add specific cleanup for other item types if needed
+
+            # Check Voice Client status
+            if not vc or not vc.is_connected():
+                log.warning(f"VC disconnected before _play_next could run for GID {guild_id}. Aborting playback.")
+                # Clear state related to this guild
+                self.guild_queues.pop(guild_id, None)
+                self.currently_playing.pop(guild_id, None)
+                self.playback_mode[guild_id] = PlaybackMode.IDLE
+                self._cancel_idle_timer(guild_id)
+                return
+
+            queue = self.guild_queues.get(guild_id)
+            if not queue:
+                log.info(f"Queue empty for GID {guild_id}. Playback finished.")
+                self.currently_playing.pop(guild_id, None) # Ensure clear if somehow missed
+                self.playback_mode[guild_id] = PlaybackMode.IDLE
+                self._start_idle_timer(guild_id, vc)
+                return
+
+            # --- Loop to find the next playable item ---
+            next_item_played = False
+            while queue:
+                item_to_try = queue[0]
+                item_type = type(item_to_try).__name__
+                log.debug(f"Checking queue item for GID {guild_id}: Type: {item_type}")
+
+                # --- Handle MusicQueueItem (adjust if other types exist) ---
+                if hasattr(item_to_try, 'download_status') and hasattr(item_to_try, 'get_playback_source'):
+                    status = item_to_try.download_status
+                    title = getattr(item_to_try, 'title', 'Unknown Title')
+                    log.debug(f"Music Item: '{title[:50]}' Status: {status}")
+
+                    if status == "ready":
+                        audio_source = item_to_try.get_playback_source()
+                        if audio_source:
+                            dequeued_item = queue.pop(0)
+                            self.currently_playing[guild_id] = dequeued_item
+                            self._cancel_idle_timer(guild_id) # Cancel timer while playing music
+                            # Ensure mode is QUEUE before playing
+                            self.playback_mode[guild_id] = PlaybackMode.QUEUE
+                            after_callback = functools.partial(self._playback_finished_callback, guild_id, vc)
+                            log.info(f"Playing '{title}' in GID {guild_id}")
+                            vc.play(audio_source, after=after_callback)
+                            next_item_played = True
+                            break # Exit the while loop, playback started
+                        else:
+                            log.error(f"Item '{title}' status is 'ready' but failed to get audio source (file missing/corrupt?). Skipping. GID: {guild_id}")
+                            item_to_try.download_status = "failed" # Mark as failed
+                            queue.pop(0) # Remove from queue
+                            continue # Try next item
+                    elif status == "failed":
+                        log.warning(f"Skipping previously failed item in queue: '{title}'. GID: {guild_id}")
+                        queue.pop(0) # Remove from queue
+                        continue # Try next item
+                    elif status in ["pending", "downloading"]:
+                        log.info(f"Next item '{title}' not ready (Status: {status}). Waiting for downloader. GID {guild_id}")
+                        break # Exit while loop, wait for downloader task to make it ready
+                    else:
+                        log.error(f"Unknown download status '{status}' for item '{title}'. Skipping. GID: {guild_id}")
+                        item_to_try.download_status = "failed" # Mark as failed
+                        queue.pop(0) # Remove from queue
+                        continue # Try next item
+
+                # --- Handle simple path items (e.g., from join events) ---
+                elif isinstance(item_to_try, tuple) and len(item_to_try) == 3 and isinstance(item_to_try[1], str):
+                    member, sound_path, is_temp_tts = item_to_try
+                    sound_basename = os.path.basename(sound_path)
+                    log.debug(f"Join Sound Item: '{sound_basename}' for {member.display_name}")
+
+                    # Process the audio using the processor
+                    audio_source, audio_buffer = audio_processor.process_audio(sound_path)
+
+                    if audio_source and audio_buffer:
+                         dequeued_item_tuple = queue.pop(0)
+                         # Store the buffer for cleanup in the callback
+                         # Use a dedicated storage or handle differently if conflicts arise
+                         self.active_single_buffers[guild_id] = audio_buffer
+                         # Track what's playing (can store the tuple or a simplified object)
+                         self.currently_playing[guild_id] = dequeued_item_tuple # Store the tuple itself
+                         self._cancel_idle_timer(guild_id) # Cancel timer while playing join sound
+                         self.playback_mode[guild_id] = PlaybackMode.QUEUE # Still part of queue processing
+
+                         # Create callback that also handles buffer cleanup
+                         def after_join_sound(error):
+                             gid_cb = guild_id
+                             path_cb = sound_path
+                             temp_cb = is_temp_tts
+                             buffer_cb = audio_buffer # Capture buffer in closure
+
+                             # Clean up buffer first
+                             if buffer_cb and not buffer_cb.closed:
+                                 try: buffer_cb.close()
+                                 except Exception: pass
+                                 log.debug(f"Closed buffer for join sound {os.path.basename(path_cb)} in GID {gid_cb}")
+
+                             # Clean up temp file if needed
+                             if temp_cb and path_cb and os.path.exists(path_cb):
+                                 try: os.remove(path_cb)
+                                 except Exception as e: log.warning(f"Failed to delete temp join sound {path_cb}: {e}")
+
+                             # Trigger the main finish handler
+                             self.bot.loop.create_task(self._playback_finished_task(gid_cb, vc, error))
+
+
+                         log.info(f"Playing join sound '{sound_basename}' for {member.display_name} in GID {guild_id}")
+                         vc.play(audio_source, after=after_join_sound)
+                         next_item_played = True
+                         break # Exit while loop
+
+                    else:
+                         log.error(f"Failed to process join sound '{sound_basename}' for {member.display_name}. Skipping. GID: {guild_id}")
+                         queue.pop(0) # Remove broken item
+                         # Cleanup temp file immediately if it failed processing
+                         if is_temp_tts and os.path.exists(sound_path):
+                             try: os.remove(sound_path)
+                             except Exception as e: log.warning(f"Failed to delete failed temp join sound {sound_path}: {e}")
+                         continue # Try next item
+
+                else:
+                    log.error(f"Unknown item type in queue for GID {guild_id}: {item_to_try}. Skipping.")
+                    queue.pop(0) # Remove unknown item
+                    continue # Try next item
+            # --- End of while loop ---
+
+            # --- Post-loop checks ---
+            if not next_item_played:
+                if not queue:
+                    # Queue became empty without playing anything (e.g., all items failed/skipped)
+                    log.info(f"Processed queue for GID {guild_id}, no playable items found, queue now empty.")
+                    self.currently_playing.pop(guild_id, None)
+                    self.playback_mode[guild_id] = PlaybackMode.IDLE
+                    self._start_idle_timer(guild_id, vc)
+                else:
+                    # Loop ended, but queue still has items (likely waiting for download)
+                    log.debug(f"Stopped processing queue for GID {guild_id}, likely waiting for download.")
+                    # Do NOT start idle timer here, downloader task should trigger playback later
+            # -----------------------
+
+        except asyncio.TimeoutError:
+            log.error(f"Timeout acquiring lock for GID {guild_id} in _play_next. Playback may be stalled.")
+            # Attempt to release lock if we somehow acquired it partially? Unlikely but safe.
+            if lock_acquired and self.guild_locks[guild_id].locked():
+                self.guild_locks[guild_id].release()
+        except Exception as e:
+            log.error(f"Unexpected error in _play_next for GID {guild_id}: {e}", exc_info=True)
+            self.currently_playing.pop(guild_id, None) # Clear playing state on error
+            self.playback_mode[guild_id] = PlaybackMode.IDLE # Revert to idle on error
+            if vc and vc.is_connected(): # Start idle timer if connected after error
+                 self._start_idle_timer(guild_id, vc)
+        finally:
+            # Ensure lock is always released
+            if lock_acquired and self.guild_locks[guild_id].locked():
+                log.debug(f"Releasing lock for GID {guild_id} in _play_next")
+                self.guild_locks[guild_id].release()
+
+
+    def _playback_finished_callback(self, guild_id: int, vc: discord.VoiceClient, error: Optional[Exception]):
+        """
+        Callback executed by discord.py after vc.play() finishes.
+        Schedules the async task handler.
+        NOTE: This runs in a separate thread context provided by discord.py.
+              Do not perform complex async operations directly here.
+        """
+        if error:
+            log.error(f"Playback error reported in callback for GID {guild_id}: {error}") # Log immediately
+        else:
+            log.debug(f"Playback finished naturally callback for GID {guild_id}.")
+
+        # Schedule the async part of the handler to run in the bot's event loop
+        self.bot.loop.call_soon_threadsafe(
+            lambda: self.bot.loop.create_task(self._playback_finished_task(guild_id, vc, error))
         )
 
-        # Play Processed Audio
-        if audio_source:
-            try:
-                self.cancel_leave_timer(guild_id, reason=f"starting playback ({item_type})"); log.info(f"{log_prefix}: Playing '{display_name}'...")
-                after_callback = lambda e: self.bot.loop.call_soon_threadsafe(self.after_play_cleanup_threadsafe, e, guild_id, task_id_obj.get_name() if task_id_obj else None, item, audio_buffer_to_close)
-                vc.play(audio_source, after=after_callback); log.debug(f"{log_prefix}: vc.play() called.")
-            except (discord.errors.ClientException, Exception) as e: log.error(f"{log_prefix}: vc.play() error: {e}", exc_info=True); self.after_play_cleanup(e, guild_id, task_id_obj.get_name() if task_id_obj else None, item, audio_buffer_to_close) # Direct cleanup on immediate error
-        else: # Processing failed
-            log.warning(f"{log_prefix}: No audio source for '{os.path.basename(sound_path)}'. Skipping.");
-            if audio_buffer_to_close and not audio_buffer_to_close.closed:
-                try:
-                    audio_buffer_to_close.close()
-                except Exception:
-                    pass
-            self._cleanup_played_item_file(item); self.currently_playing.pop(guild_id, None); self.bot.loop.create_task(self.play_next_item(guild))
+    async def _playback_finished_task(self, guild_id: int, vc: discord.VoiceClient, error: Optional[Exception]):
+        """
+        Async task handler for playback completion. Runs in the bot's event loop.
+        Acquires lock and decides whether to play next or go idle.
+        """
+        log.debug(f"Async finish handler started for GID {guild_id}. Error: {error}")
+        async with self.guild_locks[guild_id]:
+            current_mode = self.playback_mode[guild_id]
+            log.debug(f"Finish handler check: GID {guild_id}, Mode: {current_mode}")
 
-    # --- Cleanup Logic ---
-    def _cleanup_played_item_file(self, item: Optional[QueueItem]):
-        """Deletes the file associated with a played item if necessary."""
-        if not item: log.debug("FILE CLEANUP: None item."); return
-        item_type = item.get('type'); path_to_delete = item.get('path'); should_delete = False; log_prefix = "FILE CLEANUP:"
-        if item_type == 'join' and item.get('is_temp_tts', False): should_delete = True; log_prefix += f" (Temp TTS GID:{item.get('guild_id', 'N/A')}):"
-        elif item_type == 'music': should_delete = True; log_prefix += f" (Music Cache GID:{item.get('guild_id', 'N/A')}):"
-        # Add other types here if needed
-        if should_delete and path_to_delete:
-            log.debug(f"{log_prefix} Deleting: {path_to_delete}")
-            if os.path.exists(path_to_delete):
-                try: os.remove(path_to_delete); log.info(f"{log_prefix} Deleted: {path_to_delete}")
-                except OSError as e_del: log.warning(f"{log_prefix} Failed delete OSError '{path_to_delete}': {e_del}")
-                except Exception as e_del_other: log.error(f"{log_prefix} Failed delete Exception '{path_to_delete}': {e_del_other}", exc_info=True)
-            else: log.debug(f"{log_prefix} File not found '{path_to_delete}'.")
-        elif item_type and path_to_delete: log.debug(f"FILE CLEANUP: No deletion needed for type '{item_type}', path '{path_to_delete}'.")
-
-   # core/playback_manager.py
-
-    def after_play_cleanup_threadsafe(self, error: Optional[Exception], guild_id: int, task_name: Optional[str], item: Optional[QueueItem], audio_buffer: Optional[io.BytesIO]):
-        """ Threadsafe cleanup called from the 'after' callback via bot loop. """
-        # Determine a more descriptive log name if task_name is None (direct play)
-        log_task_hint = task_name if task_name else f"DirectPlay_GID_{guild_id}"
-        log_prefix = f"AFTER_PLAY_TS ({log_task_hint}):"
-
-        item_type_log = item.get('type', 'unknown') if item else 'N/A'
-        item_path_log = os.path.basename(item.get('path', 'N/A')) if item else 'N/A'
-        # Log more initial info including the item details
-        log.info(f"{log_prefix} Cleanup initiated. Item Type: '{item_type_log}', Path: '{item_path_log}'. Error: {error}")
-
-        if audio_buffer:
-            try:
-                if not audio_buffer.closed:
-                    audio_buffer.close()
-                    log.debug(f"{log_prefix} Closed audio buffer for '{item_path_log}'.")
-            except Exception as buf_e:
-                log.warning(f"{log_prefix} Error closing buffer: {buf_e}")
-
-        # Handle potential temporary file deletion (like TTS join sounds)
-        self._cleanup_played_item_file(item)
-
-        # --- Explicitly log state clearing ---
-        current_playing_item_before_pop = self.currently_playing.get(guild_id)
-        popped_item_details = "N/A"
-        if current_playing_item_before_pop:
-            popped_item_details = f"Type='{current_playing_item_before_pop.get('type', '?')}', Path='{os.path.basename(current_playing_item_before_pop.get('path', '?'))}'"
-
-        log.debug(f"{log_prefix} State before pop: currently_playing[{guild_id}] = {popped_item_details}")
-        log.debug(f"{log_prefix} Item passed to cleanup: Type='{item_type_log}', Path='{item_path_log}'")
-
-        popped_item = None
-        if item and current_playing_item_before_pop is item:
-            # The finished item matches the one we stored - normal case
-            popped_item = self.currently_playing.pop(guild_id, None)
-            log.info(f"{log_prefix} Cleared 'currently_playing' state (Exact item matched). Pop successful: {popped_item is not None}")
-        elif item and current_playing_item_before_pop:
-            # Mismatch - maybe state got overwritten or callback is delayed? Log and clear anyway.
-            log.warning(f"{log_prefix} Finished item MISMATCH! State='{popped_item_details}', Finished='{item_type_log}/{item_path_log}'. Clearing state anyway.")
-            popped_item = self.currently_playing.pop(guild_id, None)
-        elif item:
-            # Item finished, but nothing was in our state tracker
-            log.warning(f"{log_prefix} Item finished ('{item_path_log}'), but no 'currently_playing' state was recorded for guild {guild_id}.")
-        else:
-            log.debug(f"{log_prefix} Cleanup called with no specific item provided (error={error}). Checking/clearing state if present.")
-            # If cleanup was called due to an error without an item, clear any potentially stuck state
-            if self.currently_playing.get(guild_id):
-                 log.warning(f"{log_prefix} Clearing potentially stale 'currently_playing' state due to error/no item.")
-                 self.currently_playing.pop(guild_id, None)
-        # --- End explicit logging ---
-
-        current_vc = discord.utils.get(self.bot.voice_clients, guild__id=guild_id)
-        # Task check needs to happen *after* potential state clearing
-        current_task = self.guild_play_tasks.get(guild_id)
-
-        if not current_vc or not current_vc.is_connected():
-            log.warning(f"{log_prefix} VC disconnected during cleanup for '{item_path_log}'. Cleaning up task tracker.")
-            # Check if the current task matches the one that finished (if it was a task)
-            if current_task and (task_name is None or current_task.get_name() == task_name):
-                if not current_task.done():
-                    try: current_task.cancel()
-                    except Exception: pass
-                self.guild_play_tasks.pop(guild_id, None)
-                log.debug(f"{log_prefix} Removed task tracker '{task_name or 'direct'}' due to VC disconnect.")
-            self.cancel_leave_timer(guild_id, reason="after_play_ts on disconnected VC")
-            return # Exit early if no VC
-
-        # --- Check queue status AFTER state potentially cleared ---
-        queue_is_empty = guild_id not in self.guild_queues or not self.guild_queues[guild_id]
-
-        if not queue_is_empty:
-            # Queue has items, ensure playback continues
-            queue_len = len(self.guild_queues[guild_id])
-            log.info(f"{log_prefix} Queue has items ({queue_len} left). Ensuring playback continues for next item.")
-            # Ensure task restarts if needed (e.g., if the original task ended prematurely)
-            if not current_task or current_task.done():
-                log.info(f"{log_prefix} Playback task '{task_name or 'direct'}' was done or missing. Starting new task for queue.")
-                next_task_name = f"PlayTask_Restart_{guild_id}"
-                # Ensure the new task is stored correctly
-                self.guild_play_tasks[guild_id] = self.bot.loop.create_task(self.play_next_item(current_vc.guild), name=next_task_name)
+            # Only proceed to next if we are in QUEUE mode.
+            # If SINGLE_SOUND finished, its specific callback handles reverting mode.
+            # If IDLE (e.g., due to /stop), do nothing.
+            if current_mode == PlaybackMode.QUEUE:
+                 log.debug(f"Scheduling _play_next via finish handler for GID {guild_id}")
+                 # Call _play_next directly as we are already in the loop and hold the lock
+                 # Using create_task here could lead to multiple _play_next running if callback is rapid
+                 await self._play_next(guild_id, vc) # Await it directly
             else:
-                # Task still running, it should loop and pick up the next item
-                log.debug(f"{log_prefix} Task '{current_task.get_name()}' still exists and not done. Letting it loop for next item.")
-        else:
-            # Queue is empty OR this was a direct play. Bot should be idle.
-            log.info(f"{log_prefix} Queue empty or direct play '{item_path_log}' finished. Bot should be idle now.")
+                 log.debug(f"Not scheduling _play_next via finish handler for GID {guild_id} as mode is {current_mode}")
+                 # If now idle (e.g., single sound finished and queue is empty), start timer
+                 if current_mode == PlaybackMode.IDLE and vc.is_connected() and not vc.is_playing() and not self.guild_queues.get(guild_id):
+                     self._start_idle_timer(guild_id, vc)
 
-            # Remove the task tracker if it corresponds to the completed task/direct play
-            if current_task and (task_name is None or current_task.get_name() == task_name):
-                 log.debug(f"{log_prefix} Removing completed task tracker: {current_task.get_name()}.")
-                 self.guild_play_tasks.pop(guild_id, None)
-            elif current_task:
-                 # This might happen if a new task started between play ending and cleanup running
-                 log.warning(f"{log_prefix} Task tracker mismatch on cleanup. Current Task: {current_task.get_name()}, Finished Task Hint: {task_name}.")
-                 # Do not remove the wrong task tracker
 
-            # Trigger leave timer check *only after* confirming idle state and cleaning up task
-            log.info(f"{log_prefix} Triggering leave timer check as bot is now idle.")
-            self.bot.loop.create_task(self.start_leave_timer(current_vc))
+    def _start_idle_timer(self, guild_id: int, vc: discord.VoiceClient):
+        """Starts or resets the music idle disconnect timer."""
+        if IDLE_TIMEOUT_SECONDS <= 0: return # Allow disabling with 0 or negative
+        self._cancel_idle_timer(guild_id) # Cancel any existing timer first
+        log.debug(f"Starting MUSIC idle timer ({IDLE_TIMEOUT_SECONDS}s) for GID {guild_id}")
+        self.idle_timers[guild_id] = self.bot.loop.create_task(
+            self._idle_task(guild_id, vc)
+        )
 
-    def after_play_cleanup(self, error: Optional[Exception], guild_id: int, task_name: Optional[str], item: Optional[QueueItem], audio_buffer: Optional[io.BytesIO]):
-        """ [DEPRECATED] Handles cleanup ONLY if play fails immediately (within async context). """
-        log_prefix = f"AFTER_PLAY_DIRECT (Guild {guild_id}): Task: {task_name or 'NoTask'}"
-        log.warning(f"{log_prefix} Direct cleanup called (likely immediate vc.play error).")
-        if error: log.error(f'{log_prefix} Playback failed immediately: {error}', exc_info=error)
-        if audio_buffer and not audio_buffer.closed:
-            try:
-                audio_buffer.close(); log.debug(f"{log_prefix} Closed buffer.")
-            except Exception as buf_e:
-                log.warning(f"{log_prefix} Error closing buffer: {buf_e}")
-            self._cleanup_played_item_file(item);
-            self.currently_playing.pop(guild_id, None)
-            guild = self.bot.get_guild(guild_id)
-            if guild:
-                self.bot.loop.create_task(self.play_next_item(guild)) # Try next
+    def _cancel_idle_timer(self, guild_id: int):
+        """Cancels the music idle timer if it exists."""
+        if guild_id in self.idle_timers:
+            log.debug(f"Cancelling MUSIC idle timer for GID {guild_id}")
+            self.idle_timers[guild_id].cancel()
+            self.idle_timers.pop(guild_id, None) # Remove reference
 
-    # --- Voice Client Connection ---
-    async def ensure_voice_client(self, interaction: discord.Interaction, target_channel: discord.VoiceChannel, action_type: str = "Playback") -> Optional[discord.VoiceClient]:
-        """ Ensures bot is connected to the target VC and idle, ready for playback. """
-        user = interaction.user; guild = interaction.guild
-        if not guild: await self._try_respond(interaction, "Use in server.", ephemeral=True); return None
-        if not isinstance(user, discord.Member): await self._try_respond(interaction, "Not member.", ephemeral=True); return None
-        guild_id = guild.id; log_prefix = f"{action_type.upper()} GID:{guild_id}:"
-        bot_perms = target_channel.permissions_for(guild.me)
-        if not bot_perms.connect or not bot_perms.speak: await self._try_respond(interaction, f"❌ Need Connect/Speak in {target_channel.mention}.", ephemeral=True); log.warning(f"{log_prefix} Missing perms."); return None
-        vc = discord.utils.get(self.bot.voice_clients, guild=guild)
+    async def _idle_task(self, guild_id: int, vc: discord.VoiceClient):
+        """The task that waits and then checks for music idle disconnect."""
         try:
-            if vc and vc.is_connected():
-                if vc.is_playing(): await self._try_respond(interaction, "⏳ Bot busy playing.", ephemeral=True); log.info(f"{log_prefix} Bot busy playing."); return None
-                elif vc.channel != target_channel:
-                     should_move = (user.voice and user.voice.channel == target_channel) or not self.should_bot_stay(guild_id)
-                     if should_move: log.info(f"{log_prefix} Moving to '{target_channel.name}'."); self.cancel_leave_timer(guild_id, reason=f"moving for {action_type}"); await vc.move_to(target_channel); log.info(f"{log_prefix} Moved.")
-                     else: await self._try_respond(interaction, f"ℹ️ Staying in {vc.channel.mention}.", ephemeral=True); return None
-            else: log.info(f"{log_prefix} Connecting to '{target_channel.name}'."); self.cancel_leave_timer(guild_id, reason=f"connecting for {action_type}"); vc = await target_channel.connect(timeout=30.0, reconnect=True); log.info(f"{log_prefix} Connected.")
-            if not vc or not vc.is_connected(): log.error(f"{log_prefix} Failed VC establish."); await self._try_respond(interaction, "❌ Failed connect/move.", ephemeral=True); return None
-            self.cancel_leave_timer(guild_id, reason=f"VC ready for {action_type}"); return vc
-        except asyncio.TimeoutError: await self._try_respond(interaction, "❌ Timeout.", ephemeral=True); log.error(f"{log_prefix} Timeout."); return None
-        except discord.errors.ClientException as e: await self._try_respond(interaction, f"❌ Client Error: {e}", ephemeral=True); log.warning(f"{log_prefix} ClientException: {e}"); return None
-        except Exception as e: await self._try_respond(interaction, "❌ Unexpected VC error.", ephemeral=True); log.error(f"{log_prefix} Unexpected VC error: {e}", exc_info=True); return None
+             await asyncio.sleep(IDLE_TIMEOUT_SECONDS)
+             log.info(f"Music Idle timer expired for GID {guild_id}. Checking state...")
+
+             # Check conditions *inside* lock
+             async with self.guild_locks[guild_id]:
+                 # Check if still connected, not playing, queue empty, and mode is idle
+                 current_vc = discord.utils.get(self.bot.voice_clients, guild__id=guild_id)
+                 if (current_vc == vc and vc.is_connected() and
+                     not self.is_playing(guild_id) and
+                     not self.guild_queues.get(guild_id) and
+                     self.playback_mode[guild_id] == PlaybackMode.IDLE):
+
+                     log.info(f"Bot is idle from music in GID {guild_id}. Disconnecting.")
+
+                     # Send departure message (optional)
+                     if vc.channel:
+                         try:
+                             # Try system channel first, then any channel bot can send to
+                             target_channel = vc.guild.system_channel or next((c for c in vc.guild.text_channels if c.permissions_for(vc.guild.me).send_messages), None)
+                             if target_channel:
+                                 await target_channel.send(f"👋 Leaving {vc.channel.mention} due to music inactivity.")
+                         except Exception as send_e:
+                             log.warning(f"Could not send music idle departure message for GID {guild_id}: {send_e}")
+
+                     # Disconnect using safe_disconnect
+                     # Use create_task to avoid blocking if disconnect is slow
+                     self.bot.loop.create_task(self.safe_disconnect(vc, manual_leave=False, reason="Music Idle timeout"))
+
+                 else:
+                     log.debug(f"Music Idle timer expired for GID {guild_id}, but conditions changed (playing/queued/disconnected/mode!=idle). No action needed.")
+
+        except asyncio.CancelledError:
+             log.debug(f"Music idle timer task cancelled for GID {guild_id}.")
+        except Exception as e:
+             log.error(f"Error in music idle timer task for GID {guild_id}: {e}", exc_info=True)
+        finally:
+             # Ensure timer reference is removed after task finishes/cancels/errors
+             self.idle_timers.pop(guild_id, None)
+
+    async def play_single_sound(
+            self,
+            interaction: discord.Interaction,
+            sound_path: str,
+            display_name: Optional[str] = None
+        ) -> bool:
+        """
+        Plays a single audio file immediately, interrupting the queue.
+        Uses audio_processor for trimming/normalization.
+        Returns True if playback started, False otherwise.
+        Sends feedback via the interaction.
+        """
+        # Ensure required arguments are present
+        if not interaction or not interaction.guild or not isinstance(interaction.user, discord.Member) or not interaction.user.voice:
+             log.warning("play_single_sound called with invalid interaction state.")
+             # Try to send feedback if possible
+             if interaction: await self._try_respond(interaction, "❌ Cannot play sound: Invalid user or voice state.", ephemeral=True)
+             return False
+
+        guild = interaction.guild
+        user = interaction.user
+        target_channel = user.voice.channel
+        guild_id = guild.id
+        sound_basename = os.path.basename(sound_path)
+        log_display_name = display_name or sound_basename
+
+        log.info(f"Request to play single sound '{log_display_name}' in GID {guild_id}")
+
+        if not os.path.exists(sound_path):
+            log.error(f"Single sound file not found: {sound_path}")
+            await self._try_respond(interaction, "❌ Internal error: Could not find the audio file to play.", ephemeral=True)
+            return False
+
+        lock_acquired = False
+        audio_buffer = None # Define buffer variable here
+        try:
+            await asyncio.wait_for(self.guild_locks[guild_id].acquire(), timeout=10.0)
+            lock_acquired = True
+            log.debug(f"Acquired lock for GID {guild_id} in play_single_sound")
+
+            # Ensure VC is ready
+            vc = await self.ensure_voice_client(interaction, target_channel, "SINGLE SOUND")
+            if not vc:
+                log.warning(f"Failed to get VC for single sound in GID {guild_id}")
+                # ensure_voice_client sends feedback, so just return
+                return False
+
+            # --- Process Audio ---
+            log.debug(f"Processing single sound '{sound_basename}' using audio_processor...")
+            audio_source, audio_buffer = audio_processor.process_audio(sound_path)
+
+            if not audio_source or not audio_buffer:
+                 log.error(f"Failed to process single sound '{sound_path}' for GID {guild_id}")
+                 await self._try_respond(interaction, "❌ Error processing the audio file.", ephemeral=True)
+                 # Clean up buffer if it exists but source failed
+                 if audio_buffer and not audio_buffer.closed:
+                     try: audio_buffer.close()
+                     except Exception: pass
+                 return False
+            log.debug(f"Audio processed successfully for '{sound_basename}'.")
+            # ---------------------
 
 
-    # --- _try_respond (Corrected Helper) ---
+            original_mode = self.playback_mode[guild_id]
+            self.playback_mode[guild_id] = PlaybackMode.SINGLE_SOUND
+            log.debug(f"Set playback mode to SINGLE_SOUND for GID {guild_id}")
+
+            if vc.is_playing():
+                log.info(f"Stopping current playback in GID {guild_id} to play single sound.")
+                vc.stop() # Stop current playback; its 'after' should respect the new mode
+
+            self._cancel_idle_timer(guild_id) # Cancel music timer
+
+            # --- Define the 'after' callback ---
+            # This now needs to handle buffer cleanup and mode reversion
+            def single_sound_finished(error: Optional[Exception]):
+                # --- Use run_coroutine_threadsafe for async operations ---
+                async def async_cleanup():
+                    gid_cb = guild_id
+                    original_mode_cb = original_mode
+                    path_cb = sound_path # Capture path for logging
+                    log.debug(f"Single sound finished callback triggered for GID {gid_cb}. Error: {error}")
+
+                    # Pop and close the buffer associated with this guild's single play
+                    buffer_to_close = self.active_single_buffers.pop(gid_cb, None)
+                    if buffer_to_close:
+                        if not buffer_to_close.closed:
+                            try: buffer_to_close.close()
+                            except Exception as buf_e: log.warning(f"Error closing single sound buffer for GID {gid_cb}: {buf_e}")
+                        log.debug(f"Closed buffer for single sound '{os.path.basename(path_cb)}' in GID {gid_cb}")
+                    else:
+                        log.warning(f"No active single sound buffer found to close for GID {gid_cb}")
+
+                    # Acquire lock before changing mode or starting queue
+                    async with self.guild_locks[gid_cb]:
+                        # Only revert mode if it's still SINGLE_SOUND
+                        if self.playback_mode[gid_cb] == PlaybackMode.SINGLE_SOUND:
+                             self.playback_mode[gid_cb] = original_mode_cb
+                             log.info(f"Reverted playback mode to {original_mode_cb} for GID {gid_cb} after single sound.")
+
+                             # If original mode was QUEUE and queue is not empty, try resuming
+                             if original_mode_cb == PlaybackMode.QUEUE and self.guild_queues.get(gid_cb):
+                                 log.info(f"Attempting to resume queue playback for GID {gid_cb}.")
+                                 # Check VC again before starting
+                                 current_vc_cb = discord.utils.get(self.bot.voice_clients, guild__id=gid_cb)
+                                 if current_vc_cb and current_vc_cb.is_connected():
+                                     await self._play_next(gid_cb, current_vc_cb) # Call directly with lock held
+                                 else:
+                                     log.warning(f"Cannot resume queue for GID {gid_cb}, VC disconnected.")
+                             # If original mode was IDLE or QUEUE (but queue now empty), start idle timer
+                             elif not self.is_playing(gid_cb):
+                                 log.info(f"Single sound finished, no queue to resume or originally idle for GID {gid_cb}. Starting idle timer.")
+                                 current_vc_cb = discord.utils.get(self.bot.voice_clients, guild__id=gid_cb)
+                                 if current_vc_cb and current_vc_cb.is_connected():
+                                     self._start_idle_timer(gid_cb, current_vc_cb)
+                        else:
+                             log.warning(f"Single sound finished for GID {gid_cb}, but mode was already {self.playback_mode[gid_cb]}. Not reverting or resuming queue.")
+
+                    if error:
+                         log.error(f"Error during single sound playback for GID {gid_cb}: {error}", exc_info=error)
+
+                # --- Schedule the async cleanup ---
+                asyncio.run_coroutine_threadsafe(async_cleanup(), self.bot.loop)
+            # --- End of callback definition ---
+
+
+            # --- Store buffer and start playback ---
+            # Clean up any previous buffer first (should be rare)
+            old_buffer = self.active_single_buffers.pop(guild_id, None)
+            if old_buffer and not old_buffer.closed:
+                 log.warning(f"Overwriting existing single sound buffer for GID {guild_id}")
+                 try: old_buffer.close()
+                 except Exception: pass
+            self.active_single_buffers[guild_id] = audio_buffer # Store the buffer
+
+            vc.play(audio_source, after=single_sound_finished)
+            log.info(f"Started playing single sound '{log_display_name}' in GID {guild_id}")
+
+            # Send confirmation feedback
+            await self._try_respond(interaction, f"▶️ Playing `{log_display_name}`...", ephemeral=False) # Send non-ephemeral confirmation
+
+            return True # Playback started
+
+        except asyncio.TimeoutError:
+            log.error(f"Timeout acquiring lock for GID {guild_id} in play_single_sound.")
+            await self._try_respond(interaction, "❌ Could not acquire playback lock, please try again shortly.", ephemeral=True)
+            if audio_buffer and not audio_buffer.closed: # Cleanup buffer on timeout
+                try: audio_buffer.close()
+                except Exception: pass
+            return False
+        except discord.ClientException as e:
+             log.error(f"ClientException during single sound playback for GID {guild_id}: {e}", exc_info=True)
+             await self._try_respond(interaction, f"❌ Playback error: {e}", ephemeral=True)
+             self.playback_mode[guild_id] = PlaybackMode.IDLE # Revert mode on error
+             if audio_buffer and not audio_buffer.closed: # Cleanup buffer
+                 try: audio_buffer.close()
+                 except Exception: pass
+             return False
+        except Exception as e:
+            log.error(f"Unexpected error in play_single_sound for GID {guild_id}: {e}", exc_info=True)
+            self.playback_mode[guild_id] = PlaybackMode.IDLE # Revert mode on unexpected error
+            if audio_buffer and not audio_buffer.closed: # Cleanup buffer
+                try: audio_buffer.close()
+                except Exception: pass
+            await self._try_respond(interaction, "❌ An unexpected error occurred while trying to play the sound.", ephemeral=True)
+            return False
+        finally:
+            if lock_acquired and self.guild_locks[guild_id].locked():
+                log.debug(f"Releasing lock for GID {guild_id} in play_single_sound")
+                self.guild_locks[guild_id].release()
+
+    # --- End of play_single_sound ---
+
     async def _try_respond(self, interaction: discord.Interaction, message: Optional[str] = None, **kwargs):
-        """Helper to safely send/edit interaction responses, handling followup."""
+        """Helper to respond to an interaction, catching errors if it already expired/responded."""
+        if not interaction: return # Guard against None interaction
+
+        content = kwargs.pop('content', message) # Allow overriding content via kwargs
+
+        is_ephemeral = kwargs.pop('ephemeral', False)
+
         try:
             if interaction.response.is_done():
-                log.debug("Interaction response is done, using followup.send.")
-                if message or kwargs: await interaction.followup.send(content=message, **kwargs)
-                else: log.warning("Attempted followup.send without content or kwargs.")
+                # Use edit_original if already responded (followup is for new messages)
+                await interaction.edit_original_response(content=content, ephemeral=is_ephemeral, **kwargs)
             else:
-                if interaction.response._response_type is not None:
-                     log.debug("Interaction not done but responded/deferred, using edit_original_response.")
-                     kwarg_copy = kwargs.copy(); kwarg_copy.pop('ephemeral', None)
-                     if message or kwarg_copy.get('embed') or kwarg_copy.get('view') or kwarg_copy.get('file') or kwarg_copy.get('files'): await interaction.edit_original_response(content=message, **kwarg_copy)
-                     else: log.warning("Attempted edit_original_response without content or relevant kwargs.")
-                else:
-                     log.debug("Interaction not done and not responded, using response.send_message.")
-                     await interaction.response.send_message(content=message, **kwargs)
-        except discord.errors.InteractionResponded:
-            log.warning(f"Interaction already responded (race condition?), trying followup for: {message[:50] if message else 'No Message'}...")
-            try:
-                if message or kwargs: await interaction.followup.send(content=message, **kwargs)
-            except discord.NotFound: log.warning(f"Followup attempt failed: Interaction not found.")
-            except Exception as followup_e: log.error(f"Followup failed after InteractionResponded error: {followup_e}", exc_info=True)
-        except discord.NotFound: log.warning(f"Interaction not found during response attempt: {message[:50] if message else 'No Message'}...")
-        except discord.Forbidden as e: log.error(f"Response forbidden: {e}")
-        except Exception as e: log.error(f"Unexpected response error: {e}", exc_info=True)
-
-
-    # core/playback_manager.py
-
-    async def play_single_sound(self, interaction: discord.Interaction, sound_path: Optional[str] = None, audio_source: Optional[discord.PCMAudio] = None, audio_buffer_to_close: Optional[io.BytesIO] = None, display_name: Optional[str] = None):
-        """ Plays a single sound/TTS, handling VC and cleanup. """
-        user = interaction.user; guild = interaction.guild
-        if not guild or not isinstance(user, discord.Member) or not user.voice or not user.voice.channel:
-            await self._try_respond(interaction, "Need VC.", ephemeral=True)
-            # Ensure buffer is closed if we exit early
-            if audio_buffer_to_close and not audio_buffer_to_close.closed:
-                try: audio_buffer_to_close.close()
-                except Exception: pass
-            return
-
-        target_channel = user.voice.channel; guild_id = guild.id
-        action_type = "TTS PLAY" if (audio_source and not sound_path) else "SINGLE PLAY (File)"; log_prefix = f"{action_type} GID:{guild_id}:"
-
-        # Argument validation
-        if (sound_path and audio_source) or (not sound_path and not audio_source):
-            log.error(f"{log_prefix} Invalid input combo (needs either sound_path OR audio_source/buffer).")
-            await self._try_respond(interaction, "❌ Bot error (Invalid arguments).", ephemeral=True)
-            # Ensure buffer is closed on error
-            if audio_buffer_to_close and not audio_buffer_to_close.closed:
-                try: audio_buffer_to_close.close()
-                except Exception: pass
-            return
-        # Ensure buffer exists if source exists (for TTS case)
-        if audio_source and not audio_buffer_to_close:
-             log.error(f"{log_prefix} Invalid input combo (audio_source provided without audio_buffer_to_close).")
-             await self._try_respond(interaction, "❌ Bot error (Missing audio buffer).", ephemeral=True)
-             # No buffer to close here as it wasn't provided
-             return
-
-        voice_client = await self.ensure_voice_client(interaction, target_channel, action_type=action_type)
-        if not voice_client:
-            # ensure_voice_client sends feedback, just need to clean up buffer
-            if audio_buffer_to_close and not audio_buffer_to_close.closed:
-                try: audio_buffer_to_close.close()
-                except Exception: pass
-            return
-
-        final_audio_source = audio_source
-        final_buffer_to_close = audio_buffer_to_close
-        sound_display_name = display_name or "Sound"
-
-        # --- Create a minimal item for state tracking and cleanup ---
-        item_for_state_and_cleanup = {
-            'type': 'direct_play',
-            'path': sound_path or 'tts_direct', # Store path if available, otherwise indicate TTS
-            'guild_id': guild_id # Useful for logging in cleanup
-        }
-        # --- End Item Creation ---
-
-        if sound_path: # Process file only if sound_path was given
-            if not os.path.exists(sound_path):
-                await self._try_respond(interaction, f"❌ File not found: `{os.path.basename(sound_path)}`", ephemeral=True)
-                return # No buffer created yet
-            sound_display_name = os.path.splitext(os.path.basename(sound_path))[0]
-            log.info(f"{log_prefix} Processing '{sound_display_name}'...")
-            processed_source, processed_buffer = self.process_audio(sound_path, user.display_name)
-            if not processed_source:
-                await self._try_respond(interaction, f"❌ Failed process `{sound_display_name}`.", ephemeral=True)
-                if processed_buffer and not processed_buffer.closed:
-                     try: processed_buffer.close()
-                     except Exception: pass
-                # No playback happening, check if timer needed
-                self.bot.loop.create_task(self.start_leave_timer(voice_client))
-                return
-            final_audio_source = processed_source
-            final_buffer_to_close = processed_buffer # This is the buffer we need to close later
-            item_for_state_and_cleanup['path'] = sound_path # Update path in item
-
-        # --- Final check before playing ---
-        if not final_audio_source:
-            await self._try_respond(interaction, "❌ Error preparing audio source.", ephemeral=True)
-            if final_buffer_to_close and not final_buffer_to_close.closed: # Clean up if buffer exists
-                try: final_buffer_to_close.close()
-                except Exception: pass
-            return
-
-        await asyncio.sleep(0.1)
-
-        # --- Check if already playing (using internal state now too) ---
-        if voice_client.is_playing() or self.currently_playing.get(guild_id):
-            log.warning(f"{log_prefix} Attempted play while busy (vc.is_playing={voice_client.is_playing()}, self.currently_playing={self.currently_playing.get(guild_id) is not None}). Request by {user.name}.")
-            await self._try_respond(interaction, "⏳ Busy playing another sound. Please wait.", ephemeral=True)
-            if final_buffer_to_close and not final_buffer_to_close.closed: # Clean up the buffer for the *new* sound
-                try: final_buffer_to_close.close()
-                except Exception: pass
-            return
-        # --- End Busy Check ---
-
-        try:
-            # --- Set currently playing *before* calling play ---
-            self.currently_playing[guild_id] = item_for_state_and_cleanup
-            # --- End Set State ---
-
-            self.cancel_leave_timer(guild_id, reason=f"starting {action_type}")
-            log.info(f"{log_prefix} Playing '{sound_display_name}'...") # This log should now appear
-
-            # Pass the state item to the callback
-            after_callback = lambda e: self.bot.loop.call_soon_threadsafe(
-                self.after_play_cleanup_threadsafe,
-                e,
-                voice_client.guild.id,
-                None, # No specific task name for direct play
-                item_for_state_and_cleanup, # Pass the item
-                final_buffer_to_close # Pass the buffer
-            )
-            voice_client.play(final_audio_source, after=after_callback)
-
-            # Send confirmation message *after* successfully calling play
-            duration_ms = self.config.MAX_PLAYBACK_DURATION_MS
-            duration_sec_str = f"{duration_ms / 1000:.1f}".rstrip('0').rstrip('.') # Format seconds nicely
-            play_msg = f"▶️ Playing `{sound_display_name}` (max {duration_sec_str}s)..."
-            if action_type == "TTS PLAY":
-                 play_msg = f"🗣️ Playing TTS: \"{display_name}\"..." if display_name else "🗣️ Playing TTS..."
-            await self._try_respond(interaction, play_msg, ephemeral=False) # Use ephemeral=False for play confirmation
-
-        except discord.errors.ClientException as e:
-            await self._try_respond(interaction, "❌ Client error during playback.", ephemeral=True)
-            log.error(f"{log_prefix} ClientException on play: {e}", exc_info=True)
-            # --- Cleanup state and buffer on immediate error ---
-            self.currently_playing.pop(guild_id, None)
-            if final_buffer_to_close and not final_buffer_to_close.closed:
-                try: final_buffer_to_close.close()
-                except Exception: pass
-            # Trigger leave timer check as playback failed
-            self.bot.loop.create_task(self.start_leave_timer(voice_client))
-            # --- End Cleanup ---
+                # Use send_message for the initial response
+                await interaction.response.send_message(content=content, **kwargs)
+        except discord.NotFound:
+            log.warning(f"Interaction response failed (NotFound - likely expired): {interaction.id}")
+        except discord.HTTPException as e:
+            # InteractionAlreadyResponded is an HTTPException
+            if e.code == 40060: # Interaction has already been responded to
+                 log.warning(f"Interaction response failed (Already Responded): {interaction.id}. Trying followup...")
+                 # If initial response failed because it was *already* responded to (e.g. defer), try followup
+                 try:
+                     await interaction.followup.send(content=content, ephemeral=is_ephemeral, **kwargs)
+                 except discord.NotFound:
+                      log.warning(f"Followup failed (NotFound) for interaction: {interaction.id}")
+                 except Exception as followup_e:
+                      log.error(f"Error sending followup for interaction {interaction.id}: {followup_e}", exc_info=True)
+            else:
+                 log.warning(f"Interaction response failed (HTTPException {e.status} / {e.code}): {interaction.id}")
         except Exception as e:
-            await self._try_respond(interaction, "❌ Unexpected playback error.", ephemeral=True)
-            log.error(f"{log_prefix} Unexpected error on play: {e}", exc_info=True)
-             # --- Cleanup state and buffer on immediate error ---
-            self.currently_playing.pop(guild_id, None)
-            if final_buffer_to_close and not final_buffer_to_close.closed:
-                try: final_buffer_to_close.close()
-                except Exception: pass
-            # Trigger leave timer check as playback failed
-            self.bot.loop.create_task(self.start_leave_timer(voice_client))
-            # --- End Cleanup ---
+            log.error(f"Unexpected error responding to interaction {interaction.id}: {e}", exc_info=True)
 
 
-    # --- Idle/Leave Timer Logic ---
-    def should_bot_stay(self, guild_id: int) -> bool:
-        settings = self.bot.guild_settings.get(str(guild_id), {}); stay = settings.get("stay_in_channel", False); log.debug(f"Stay check GID:{guild_id}: {stay}"); return stay is True
-    def is_bot_alone(self, vc: Optional[discord.VoiceClient]) -> bool:
-        if not vc or not vc.channel: return False; member_count = len(vc.channel.members); is_alone = member_count <= 1; log.debug(f"ALONE CHECK GID:{vc.guild.id}: {member_count} members. Alone: {is_alone}"); return is_alone
-    # core/playback_manager.py
+    async def play_audio_source_now(
+            self,
+            interaction: discord.Interaction,
+            audio_source: discord.PCMAudio, # Takes the source directly
+            audio_buffer_to_close: io.BytesIO, # Takes the buffer to close
+            display_name: Optional[str] = None # For logging/feedback
+        ) -> bool:
+            """
+            Plays a prepared audio source immediately, interrupting the queue.
+            Manages the provided buffer for cleanup.
+            Used for sources like TTS that are generated in memory.
+            """
+            if not interaction or not interaction.guild or not isinstance(interaction.user, discord.Member) or not interaction.user.voice:
+                log.warning("play_audio_source_now called with invalid interaction state.")
+                if interaction: await self._try_respond(interaction, "❌ Cannot play sound: Invalid user or voice state.", ephemeral=True)
+                return False
 
-# core/playback_manager.py
+            guild = interaction.guild
+            user = interaction.user
+            target_channel = user.voice.channel
+            guild_id = guild.id
+            log_display_name = display_name or "Audio Source"
 
-    def cancel_leave_timer(self, guild_id: int, reason: str = "unknown"):
-        if guild_id in self.guild_leave_timers:
-            # --- Moved this line inside the 'if' block ---
-            timer_task = self.guild_leave_timers.pop(guild_id, None) # Pop returns the task or None
+            log.info(f"Request to play single audio source '{log_display_name}' in GID {guild_id}")
 
-            # --- Now this check is safe ---
-            if timer_task and not timer_task.done():
-                try:
-                    timer_task.cancel()
-                    log.info(f"LEAVE TIMER GID:{guild_id}: Cancelled. Reason: {reason}")
-                except Exception as e:
-                    log.warning(f"LEAVE TIMER GID:{guild_id}: Error cancelling: {e}")
-            elif timer_task: # It existed but was already done
-                log.debug(f"LEAVE TIMER GID:{guild_id}: Attempted cancel on completed timer.")
-        # If guild_id wasn't in the dict, nothing happens, which is correct.
-    async def start_leave_timer(self, vc: discord.VoiceClient):
-        if not vc or not vc.is_connected() or not vc.guild: return
-        guild_id = vc.guild.id; log_prefix = f"LEAVE TIMER (Guild {guild_id}):"; self.cancel_leave_timer(guild_id, reason="starting new check")
-        if self.should_bot_stay(guild_id): log.debug(f"{log_prefix} Stay enabled."); return
-        if not self.is_bot_alone(vc): log.debug(f"{log_prefix} Not alone."); return
-        if vc.is_playing(): log.debug(f"{log_prefix} Playing."); return
-        timeout = self.config.AUTO_LEAVE_TIMEOUT_SECONDS; log.info(f"{log_prefix} Starting {timeout}s timer.")
-        timer_task = self.bot.loop.create_task(self._leave_after_delay(vc.guild.id, vc.channel.id, timeout), name=f"AutoLeave_{guild_id}"); self.guild_leave_timers[guild_id] = timer_task
-    async def _leave_after_delay(self, g_id: int, initial_channel_id: int, delay: float):
-        log_prefix = f"LEAVE TIMER (Guild {g_id}):"; task_ref = asyncio.current_task()
-        try:
-             await asyncio.sleep(delay); log.debug(f"{log_prefix} Timer expired."); current_vc = discord.utils.get(self.bot.voice_clients, guild__id=g_id)
-             guild = self.bot.get_guild(g_id); original_channel = guild.get_channel(initial_channel_id) if guild else None
-             if not current_vc or not current_vc.is_connected() or current_vc.channel.id != initial_channel_id: log.info(f"{log_prefix} Bot moved/disconnected."); return
-             if self.should_bot_stay(g_id): log.info(f"{log_prefix} Stay enabled during wait."); return
-             if not self.is_bot_alone(current_vc): log.info(f"{log_prefix} Not alone anymore."); return
-             if current_vc.is_playing(): log.info(f"{log_prefix} Started playing again."); return
-             log.info(f"{log_prefix} Conditions met. Disconnecting."); await self.safe_disconnect(current_vc, manual_leave=False, reason="timer expired")
-        except asyncio.CancelledError: log.info(f"{log_prefix} Timer cancelled.")
-        except Exception as e: log.error(f"{log_prefix} Error during timer: {e}", exc_info=True)
-        finally: # Cleanup timer reference
-             if g_id in self.guild_leave_timers and self.guild_leave_timers.get(g_id) is task_ref: del self.guild_leave_timers[g_id]; log.debug(f"{log_prefix} Cleaned up timer task ref.")
+            if not audio_source or not audio_buffer_to_close:
+                log.error(f"play_audio_source_now called with missing audio_source or buffer for GID {guild_id}")
+                await self._try_respond(interaction, "❌ Internal error: Missing audio data to play.", ephemeral=True)
+                return False
+
+            lock_acquired = False
+            try:
+                await asyncio.wait_for(self.guild_locks[guild_id].acquire(), timeout=10.0)
+                lock_acquired = True
+                log.debug(f"Acquired lock for GID {guild_id} in play_audio_source_now")
+
+                vc = await self.ensure_voice_client(interaction, target_channel, "DIRECT AUDIO PLAY")
+                if not vc:
+                    log.warning(f"Failed to get VC for direct audio source in GID {guild_id}")
+                    # ensure_voice_client sends feedback
+                    return False
+
+                original_mode = self.playback_mode[guild_id]
+                self.playback_mode[guild_id] = PlaybackMode.SINGLE_SOUND # Treat like single sound mode
+                log.debug(f"Set playback mode to SINGLE_SOUND for GID {guild_id} (direct source)")
+
+                if vc.is_playing():
+                    log.info(f"Stopping current playback in GID {guild_id} to play direct audio source.")
+                    vc.stop()
+
+                self._cancel_idle_timer(guild_id)
+
+                # --- Define the 'after' callback specifically for this method ---
+                def direct_source_finished(error: Optional[Exception]):
 
 
-    # --- Safe Disconnect ---
-    async def safe_disconnect(self, vc: Optional[discord.VoiceClient], *, manual_leave: bool = False, reason: str = "disconnect"):
-        if not vc or not vc.is_connected() or not vc.guild: return
-        guild = vc.guild; guild_id = guild.id; log_prefix = f"DISCONNECT GID:{guild_id}:"; self.cancel_leave_timer(guild_id, reason=f"safe_disconnect ({reason})")
-        if not manual_leave and self.should_bot_stay(guild_id): log.debug(f"{log_prefix} Stay enabled, skip disconnect."); return
-        disconnect_reason_log = "Manual" if manual_leave else f"Auto ({reason})"; log.info(f"{log_prefix} Disconnecting from {guild.name} (Reason: {disconnect_reason_log}).")
-        try:
-            if vc.is_playing(): log.info(f"{log_prefix} Stopping playback."); vc.stop()
-            await vc.disconnect(force=False); log.info(f"{log_prefix} Bot disconnected.")
-            # Redundant cleanup
-            if guild_id in self.guild_play_tasks: task = self.guild_play_tasks.pop(guild_id, None); # cancel if needed
-            if guild_id in self.guild_queues: self.guild_queues[guild_id].clear()
-            self.currently_playing.pop(guild_id, None)
-        except Exception as e: log.error(f"{log_prefix} Disconnect error: {e}", exc_info=True)
+                    async def async_cleanup():
+                        gid_cb = guild_id
+                        original_mode_cb = original_mode
+                        buffer_cb = audio_buffer_to_close # Capture the specific buffer
+                        log.debug(f"Direct source finished callback triggered for GID {gid_cb}. Error: {error}")
+
+                        # Close the provided buffer
+                        if buffer_cb:
+                            if not buffer_cb.closed:
+                                try: buffer_cb.close()
+                                except Exception as buf_e: log.warning(f"Error closing direct source buffer for GID {gid_cb}: {buf_e}")
+                            log.debug(f"Closed buffer for direct source play in GID {gid_cb}")
+                        else:
+                            # This shouldn't happen based on the check above, but log if it does
+                            log.warning(f"Direct source finished callback missing buffer for GID {gid_cb}")
+
+                        if error:
+                            log.error(f"Error during direct source playback for GID {gid_cb}: {error}", exc_info=error)
+
+                    asyncio.run_coroutine_threadsafe(async_cleanup(), self.bot.loop)
+                # --- End of callback definition ---
+
+                # --- Start playback ---
+                # Note: We don't store this buffer in self.active_single_buffers,
+                # the callback closes the one passed in directly.
+                vc.play(audio_source, after=direct_source_finished)
+                log.info(f"Started playing direct audio source '{log_display_name}' in GID {guild_id}")
+
+                await self._try_respond(interaction, f"🗣️ Playing `{log_display_name}`...", ephemeral=False) # TTS confirmation
+
+                return True # Playback started
+
+            except asyncio.TimeoutError:
+                log.error(f"Timeout acquiring lock for GID {guild_id} in play_audio_source_now.")
+                await self._try_respond(interaction, "❌ Could not acquire playback lock, please try again shortly.", ephemeral=True)
+                # Cleanup buffer if lock fails
+                if audio_buffer_to_close and not audio_buffer_to_close.closed:
+                    try: audio_buffer_to_close.close()
+                    except Exception: pass
+                return False
+            except discord.ClientException as e:
+                log.error(f"ClientException during direct source playback for GID {guild_id}: {e}", exc_info=True)
+                await self._try_respond(interaction, f"❌ Playback error: {e}", ephemeral=True)
+                self.playback_mode[guild_id] = PlaybackMode.IDLE # Revert mode on error
+                if audio_buffer_to_close and not audio_buffer_to_close.closed: # Cleanup buffer
+                    try: audio_buffer_to_close.close()
+                    except Exception: pass
+                return False
+            except Exception as e:
+                log.error(f"Unexpected error in play_audio_source_now for GID {guild_id}: {e}", exc_info=True)
+                self.playback_mode[guild_id] = PlaybackMode.IDLE # Revert mode
+                if audio_buffer_to_close and not audio_buffer_to_close.closed: # Cleanup buffer
+                    try: audio_buffer_to_close.close()
+                    except Exception: pass
+                await self._try_respond(interaction, "❌ An unexpected error occurred while trying to play the sound.", ephemeral=True)
+                return False
+            finally:
+                if lock_acquired and self.guild_locks[guild_id].locked():
+                    log.debug(f"Releasing lock for GID {guild_id} in play_audio_source_now")
+                    self.guild_locks[guild_id].release()
+                    
+    # --- End of PlaybackManager class ---

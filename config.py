@@ -201,3 +201,9 @@ try:
     import nacl
     NACL_AVAILABLE = True
 except ImportError: pass
+
+
+MUSIC_CACHE_TTL_DAYS = 30
+MUSIC_CACHE_DIR = "music_cache"
+MUSIC_DOWNLOAD_INTERVAL = 5 # seconds
+MUSIC_CLEANUP_INTERVAL = 3600 # Once per hour

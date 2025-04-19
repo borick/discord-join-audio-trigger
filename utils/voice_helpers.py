@@ -5,6 +5,7 @@ import logging
 from typing import Optional, Dict, Any
 
 import data_manager # To access guild settings
+import config as bot_config_module
 
 log = logging.getLogger('SoundBot.VoiceHelpers')
 
@@ -54,7 +55,9 @@ async def start_leave_timer(bot: discord.Bot, vc: discord.VoiceClient):
 
     # Assumes guild_leave_timers and AUTO_LEAVE_TIMEOUT_SECONDS are accessible via bot or config
     guild_leave_timers = getattr(bot, 'guild_leave_timers', {})
-    auto_leave_timeout = getattr(bot, 'config', {}).get('AUTO_LEAVE_TIMEOUT_SECONDS', 14400) # Default 4h
+
+    bot_config = getattr(bot, 'config', bot_config_module)
+    auto_leave_timeout = getattr(bot_config, 'AUTO_LEAVE_TIMEOUT_SECONDS', 14400)
 
     # 1. Cancel any existing timer first
     cancel_leave_timer(bot, guild_id, reason="starting new timer check")
