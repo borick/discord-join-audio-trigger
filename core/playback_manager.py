@@ -353,7 +353,7 @@ class PlaybackManager:
                     log.debug(f"Music Item: '{title[:50]}' Status Enum: {status}")
 
                     if status == DownloadStatus.READY:
-                        audio_source = item_to_try.get_playback_source()
+                        audio_source = await item_to_try.get_playback_source()
                         if audio_source:
                             dequeued_item = queue.pop(0)
                             self.currently_playing[guild_id] = dequeued_item

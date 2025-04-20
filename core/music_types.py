@@ -1,5 +1,6 @@
 # core/music_types.py
 
+import asyncio
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional
@@ -7,6 +8,9 @@ import discord # For discord.AudioSource type hint if needed later
 import time
 import datetime
 import os # For os.path.exists
+import logging
+
+log = logging.getLogger('SoundBot.MusicTypes')
 
 # --- Enums and Dataclasses ---
 class DownloadStatus(Enum):
@@ -59,20 +63,30 @@ class MusicQueueItem:
             return thumbnails[-1].get('url')
         return self.video_info.get('thumbnail')
 
-    # --- Methods ---
-    def get_playback_source(self) -> Optional[discord.AudioSource]:
-        """Returns a playable discord.AudioSource if ready, None otherwise."""
-        # Logger for this specific function if needed
-        # log = logging.getLogger('SoundBot.MusicTypes')
+    async def get_playback_source(self) -> Optional[discord.AudioSource]:
         if self.download_status == DownloadStatus.READY and self.download_path and os.path.exists(self.download_path):
             try:
                 ffmpeg_options = {'options': '-vn'}
-                return discord.FFmpegPCMAudio(self.download_path, **ffmpeg_options)
+                loop = asyncio.get_running_loop()
+
+                # Define a synchronous function for the blocking part
+                def _create_ffmpeg_source():
+                    # This runs in the executor thread
+                    return discord.FFmpegPCMAudio(self.download_path, **ffmpeg_options)
+
+                # Run the blocking function in the executor
+                audio_source = await loop.run_in_executor(None, _create_ffmpeg_source)
+                # 'None' uses the default ThreadPoolExecutor
+
+                return audio_source
             except Exception as e:
-                print(f"[ERROR] Failed to create FFmpegPCMAudio source for {self.download_path}: {e}") # Use print or log
-                self.download_status = DownloadStatus.FAILED # Mark as failed if source creation fails
+                log.error(f"[ERROR] Failed to create FFmpegPCMAudio source for {self.download_path}: {e}", exc_info=True)
+                self.download_status = DownloadStatus.FAILED # Mark as failed if creation fails
                 return None
-        # Optional: Add logging for why source isn't returned
-        # elif self.download_status != DownloadStatus.READY: ...
-        # elif not self.download_path or not os.path.exists(self.download_path): ...
-        return None
+        else:
+            log.warning(f"get_playback_source called but not ready. Status: {self.download_status}, Path: {self.download_path}")
+            if self.download_status != DownloadStatus.FAILED:
+                 # If path exists but status isn't READY, maybe reset? Or handle upstream.
+                 # For now, just ensure it fails if conditions aren't met.
+                 pass # Or potentially set status to FAILED if path exists but status is wrong.
+            return None

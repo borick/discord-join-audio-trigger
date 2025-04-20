@@ -5,3 +5,5 @@
 *.mp4
 __pycache__
 *.pyc
+*.opus
+music_cache
