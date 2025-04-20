@@ -2,7 +2,8 @@
     "1046151345922641990": {
         "tts_defaults": {
             "voice": "en-US-JennyNeural"
-        }
+        },
+        "join_sound": "ding.ogg"
     },
     "259062089128214541": {
         "join_sound": "joinsound_259062089128214541.wav"

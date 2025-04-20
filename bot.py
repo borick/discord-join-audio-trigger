@@ -27,7 +27,7 @@ root_logger.setLevel(logging.INFO) # Set root level (e.g., INFO)
 root_logger.addHandler(console_handler)
 # Configure specific loggers
 logging.getLogger('discord').setLevel(logging.WARNING) # Reduce discord lib noise
-logging.getLogger('SoundBot').setLevel(logging.INFO) # Main bot logger
+logging.getLogger('SoundBot').setLevel(logging.DEBUG)
 # Add more specific log levels if needed (e.g., logging.getLogger('SoundBot.PlaybackManager').setLevel(logging.DEBUG))
 log = logging.getLogger('SoundBot.Main')
 
