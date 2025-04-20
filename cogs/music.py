@@ -752,6 +752,7 @@ def setup(bot: commands.Bot):
     try:
         log.debug("Attempting to import yt_dlp...")
         import yt_dlp
+        
         log.info("yt_dlp imported successfully.")
     except ImportError:
         log.critical("Music Cog requires 'yt-dlp'. Please install it (`pip install yt-dlp`). Cog not loaded.")

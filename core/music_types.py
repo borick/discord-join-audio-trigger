@@ -9,7 +9,6 @@ import time
 import datetime
 import os # For os.path.exists
 import logging
-
 log = logging.getLogger('SoundBot.MusicTypes')
 
 # --- Enums and Dataclasses ---
@@ -69,24 +68,19 @@ class MusicQueueItem:
                 ffmpeg_options = {'options': '-vn'}
                 loop = asyncio.get_running_loop()
 
-                # Define a synchronous function for the blocking part
                 def _create_ffmpeg_source():
-                    # This runs in the executor thread
+                    log.debug(f"Creating FFmpegPCMAudio source for: {self.download_path}")
                     return discord.FFmpegPCMAudio(self.download_path, **ffmpeg_options)
 
-                # Run the blocking function in the executor
+                log.debug(f"Running FFmpegPCMAudio creation in executor for: {self.download_path}")
                 audio_source = await loop.run_in_executor(None, _create_ffmpeg_source)
-                # 'None' uses the default ThreadPoolExecutor
-
+                log.debug(f"Successfully created FFmpegPCMAudio source for: {self.download_path}")
                 return audio_source
             except Exception as e:
                 log.error(f"[ERROR] Failed to create FFmpegPCMAudio source for {self.download_path}: {e}", exc_info=True)
-                self.download_status = DownloadStatus.FAILED # Mark as failed if creation fails
+                self.download_status = DownloadStatus.FAILED
                 return None
         else:
-            log.warning(f"get_playback_source called but not ready. Status: {self.download_status}, Path: {self.download_path}")
-            if self.download_status != DownloadStatus.FAILED:
-                 # If path exists but status isn't READY, maybe reset? Or handle upstream.
-                 # For now, just ensure it fails if conditions aren't met.
-                 pass # Or potentially set status to FAILED if path exists but status is wrong.
+            # Log why it's failing if conditions aren't met
+            log.warning(f"get_playback_source called but conditions not met. Status: {self.download_status}, Path: {self.download_path}, Exists: {os.path.exists(self.download_path) if self.download_path else 'N/A'}")
             return None
